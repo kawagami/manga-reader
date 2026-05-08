@@ -225,6 +225,7 @@ function App() {
           viewMode={viewMode}
           loadedUrls={loadedImages}
           error={zipError}
+          zipKey={selectedZip}
         />
       </div>
     </div>

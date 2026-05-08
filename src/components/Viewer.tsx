@@ -7,14 +7,16 @@ interface ViewerProps {
   viewMode: ViewMode;
   loadedUrls: Map<string, string>;
   error?: string | null;
+  zipKey?: string | null;
 }
 
-export function Viewer({ images, currentPage, viewMode, loadedUrls, error }: ViewerProps) {
+export function Viewer({ images, currentPage, viewMode, loadedUrls, error, zipKey }: ViewerProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  // Reset scroll only when zip changes, not when images are appended mid-stream
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
-  }, [images]);
+  }, [zipKey]);
 
   if (error) {
     return (
