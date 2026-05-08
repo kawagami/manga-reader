@@ -1,0 +1,200 @@
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use serde::{Deserialize, Serialize};
+use tauri::ipc::Channel;
+use walkdir::WalkDir;
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ZipFileEntry {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct FolderEntry {
+    pub name: String,
+    pub path: String,
+    pub zip_files: Vec<ZipFileEntry>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ImagePayload {
+    pub name: String,
+    pub index: usize,
+    pub total: usize,
+    pub data: String,
+    pub mime_type: String,
+}
+
+fn natural_sort_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut a_iter = a.chars().peekable();
+    let mut b_iter = b.chars().peekable();
+    loop {
+        let a_digit = a_iter.peek().map(|c| c.is_ascii_digit()).unwrap_or(false);
+        let b_digit = b_iter.peek().map(|c| c.is_ascii_digit()).unwrap_or(false);
+        if a_digit && b_digit {
+            let mut a_num = String::new();
+            let mut b_num = String::new();
+            while a_iter.peek().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                a_num.push(a_iter.next().unwrap());
+            }
+            while b_iter.peek().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                b_num.push(b_iter.next().unwrap());
+            }
+            let ord = a_num.parse::<u64>().unwrap_or(0).cmp(&b_num.parse::<u64>().unwrap_or(0));
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        } else {
+            match (a_iter.next(), b_iter.next()) {
+                (None, None) => return std::cmp::Ordering::Equal,
+                (None, _) => return std::cmp::Ordering::Less,
+                (_, None) => return std::cmp::Ordering::Greater,
+                (Some(ac), Some(bc)) => {
+                    let ord = ac.to_ascii_lowercase().cmp(&bc.to_ascii_lowercase());
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn is_image_file(name: &str) -> bool {
+    matches!(
+        Path::new(name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .as_deref(),
+        Some("jpg") | Some("jpeg") | Some("png") | Some("webp") | Some("gif")
+    )
+}
+
+fn mime_from_name(name: &str) -> String {
+    match Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        _ => "image/jpeg",
+    }
+    .to_string()
+}
+
+#[tauri::command]
+fn scan_directory(path: String) -> Result<Vec<FolderEntry>, String> {
+    let root = Path::new(&path);
+    let mut folder_map: HashMap<String, FolderEntry> = HashMap::new();
+
+    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let file_path = entry.path();
+        let ext = file_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase());
+        if !matches!(ext.as_deref(), Some("zip") | Some("cbz")) {
+            continue;
+        }
+        let parent = match file_path.parent() {
+            Some(p) => p,
+            None => continue,
+        };
+        let folder_path = parent.to_string_lossy().to_string();
+        let folder_name = parent
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("(root)")
+            .to_string();
+        let zip_name = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        let folder = folder_map.entry(folder_path.clone()).or_insert_with(|| FolderEntry {
+            name: folder_name,
+            path: folder_path,
+            zip_files: Vec::new(),
+        });
+        folder.zip_files.push(ZipFileEntry {
+            name: zip_name,
+            path: file_path.to_string_lossy().to_string(),
+        });
+    }
+
+    let mut folders: Vec<FolderEntry> = folder_map.into_values().collect();
+    for folder in &mut folders {
+        folder.zip_files.sort_by(|a, b| natural_sort_cmp(&a.name, &b.name));
+    }
+    folders.sort_by(|a, b| natural_sort_cmp(&a.name, &b.name));
+    Ok(folders)
+}
+
+// Opens the zip once, decodes each image in sorted order, pushes via channel.
+// First image arrives on the frontend as soon as it's decoded — no waiting for the full zip.
+#[tauri::command]
+async fn stream_zip_images(
+    zip_path: String,
+    on_image: Channel<ImagePayload>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let file = File::open(&zip_path).map_err(|e| e.to_string())?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+
+        // First pass: collect image names (reads zip central directory only)
+        let mut names: Vec<String> = (0..archive.len())
+            .filter_map(|i| {
+                let entry = archive.by_index(i).ok()?;
+                let name = entry.name().to_string();
+                if is_image_file(&name) { Some(name) } else { None }
+            })
+            .collect();
+        names.sort_by(|a, b| natural_sort_cmp(a, b));
+
+        let total = names.len();
+
+        // Second pass: decode each image and stream to frontend immediately
+        for (index, name) in names.iter().enumerate() {
+            let mut entry = archive.by_name(name).map_err(|e| e.to_string())?;
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+
+            on_image
+                .send(ImagePayload {
+                    mime_type: mime_from_name(name),
+                    data: STANDARD.encode(&bytes),
+                    name: name.clone(),
+                    index,
+                    total,
+                })
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_store::Builder::new().build())
+        .plugin(tauri_plugin_window_state::Builder::new().build())
+        .invoke_handler(tauri::generate_handler![scan_directory, stream_zip_images])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
