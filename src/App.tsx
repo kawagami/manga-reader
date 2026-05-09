@@ -16,6 +16,7 @@ function getMimeType(name: string): string {
 }
 import { Sidebar } from "./components/Sidebar";
 import { Viewer } from "./components/Viewer";
+import { Gallery } from "./components/Gallery";
 import "./App.css";
 
 const STORE_FILE = "settings.json";
@@ -31,10 +32,12 @@ function App() {
   const [loadedImages, setLoadedImages] = useState<Map<string, string>>(new Map());
   const [isDragOver, setIsDragOver] = useState(false);
   const [zipError, setZipError] = useState<string | null>(null);
+  const [coverImages, setCoverImages] = useState<Map<string, string>>(new Map());
 
-  // Tracks which zip's stream is active — stale messages from a previous zip are dropped
   const activeZipRef = useRef<string | null>(null);
   const loadedRef = useRef<Map<string, string>>(new Map());
+  const coverImagesRef = useRef<Map<string, string>>(new Map());
+  const loadingCoversRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     restoreStateCurrent(StateFlags.ALL).catch(() => {});
@@ -62,11 +65,43 @@ function App() {
   }, []);
 
   const scanDir = useCallback(async (dir: string) => {
+    coverImagesRef.current.forEach((url) => URL.revokeObjectURL(url));
+    coverImagesRef.current = new Map();
+    loadingCoversRef.current.clear();
+    setCoverImages(new Map());
+
     const tree = await invoke<FolderEntry[]>("scan_directory", { path: dir });
     setFolderTree(tree);
     const store = await Store.load(STORE_FILE, { defaults: {} });
     await store.set(KEY_LAST_DIR, dir);
     await store.save();
+  }, []);
+
+  const loadCover = useCallback(async (zipPath: string): Promise<void> => {
+    if (coverImagesRef.current.has(zipPath) || loadingCoversRef.current.has(zipPath)) return;
+    loadingCoversRef.current.add(zipPath);
+    try {
+      const buffer = await invoke<ArrayBuffer>("load_first_image", { zipPath });
+      // GPU-accelerated decode + resize via WebView2
+      const bitmap = await createImageBitmap(new Blob([buffer]));
+      const THUMB_W = 150;
+      const THUMB_H = 200;
+      const scale = Math.min(THUMB_W / bitmap.width, THUMB_H / bitmap.height);
+      const w = Math.round(bitmap.width * scale);
+      const h = Math.round(bitmap.height * scale);
+      const oc = new OffscreenCanvas(w, h);
+      const ctx = oc.getContext("2d")!;
+      ctx.drawImage(bitmap, 0, 0, w, h);
+      bitmap.close();
+      const blob = await oc.convertToBlob({ type: "image/jpeg", quality: 0.8 });
+      const url = URL.createObjectURL(blob);
+      coverImagesRef.current.set(zipPath, url);
+      setCoverImages(new Map(coverImagesRef.current));
+    } catch (e) {
+      console.error(`loadCover failed: ${zipPath}`, e);
+    } finally {
+      loadingCoversRef.current.delete(zipPath);
+    }
   }, []);
 
   const selectRoot = async () => {
@@ -162,7 +197,7 @@ function App() {
   };
 
   const jumpPage = (delta: number) => {
-    if (viewMode === "scroll") return;
+    if (viewMode === "scroll" || viewMode === "gallery") return;
     setCurrentPage((p) => Math.max(0, Math.min(p + delta, images.length - 1)));
   };
 
@@ -179,13 +214,13 @@ function App() {
     { code: "PageDown",            handler: () => jumpPage(+stride * 5) },
     { code: "Numpad7",             handler: () => jumpPage(-stride * 5) },
     { code: "Numpad9",             handler: () => jumpPage(+stride * 5) },
-    { code: "Numpad4",             handler: () => { if (viewMode !== "scroll") goPrev(); } },
-    { code: "Numpad6",             handler: () => { if (viewMode !== "scroll") goNext(); } },
-    { key: "ArrowRight",           handler: () => { if (viewMode !== "scroll") goNext(); } },
-    { key: "ArrowDown",            handler: () => { if (viewMode !== "scroll") goNext(); } },
-    { key: "ArrowLeft",            handler: () => { if (viewMode !== "scroll") goPrev(); } },
-    { key: "ArrowUp",              handler: () => { if (viewMode !== "scroll") goPrev(); } },
-    { key: " ",                    handler: () => { if (viewMode !== "scroll") goNext(); } },
+    { code: "Numpad4",             handler: () => { if (viewMode === "single" || viewMode === "double") goPrev(); } },
+    { code: "Numpad6",             handler: () => { if (viewMode === "single" || viewMode === "double") goNext(); } },
+    { key: "ArrowRight",           handler: () => { if (viewMode === "single" || viewMode === "double") goNext(); } },
+    { key: "ArrowDown",            handler: () => { if (viewMode === "single" || viewMode === "double") goNext(); } },
+    { key: "ArrowLeft",            handler: () => { if (viewMode === "single" || viewMode === "double") goPrev(); } },
+    { key: "ArrowUp",              handler: () => { if (viewMode === "single" || viewMode === "double") goPrev(); } },
+    { key: " ",                    handler: () => { if (viewMode === "single" || viewMode === "double") goNext(); } },
   ]);
 
   const totalPages =
@@ -201,13 +236,13 @@ function App() {
           Open Directory
         </button>
         <div className="mode-group">
-          {(["single", "double", "scroll"] as ViewMode[]).map((m) => (
+          {(["single", "double", "scroll", "gallery"] as ViewMode[]).map((m) => (
             <button
               key={m}
               className={`mode-btn${viewMode === m ? " mode-active" : ""}`}
               onClick={() => changeViewMode(m)}
             >
-              {m === "single" ? "Single" : m === "double" ? "Double" : "Scroll"}
+              {m === "single" ? "Single" : m === "double" ? "Double" : m === "scroll" ? "Scroll" : "Gallery"}
             </button>
           ))}
         </div>
@@ -235,19 +270,31 @@ function App() {
       </div>
 
       <div className="layout">
-        <Sidebar
-          folders={folderTree}
-          selectedZip={selectedZip}
-          onSelectZip={selectZip}
-        />
-        <Viewer
-          images={images}
-          currentPage={currentPage}
-          viewMode={viewMode}
-          loadedUrls={loadedImages}
-          error={zipError}
-          zipKey={selectedZip}
-        />
+        {viewMode === "gallery" ? (
+          <Gallery
+            folders={folderTree}
+            coverImages={coverImages}
+            selectedZip={selectedZip}
+            onSelectZip={(path) => { selectZip(path); changeViewMode("single"); }}
+            onLoadCover={(path) => loadCover(path)}
+          />
+        ) : (
+          <>
+            <Sidebar
+              folders={folderTree}
+              selectedZip={selectedZip}
+              onSelectZip={selectZip}
+            />
+            <Viewer
+              images={images}
+              currentPage={currentPage}
+              viewMode={viewMode}
+              loadedUrls={loadedImages}
+              error={zipError}
+              zipKey={selectedZip}
+            />
+          </>
+        )}
       </div>
     </div>
   );

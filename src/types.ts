@@ -9,4 +9,4 @@ export interface FolderEntry {
   zip_files: ZipFileEntry[];
 }
 
-export type ViewMode = "single" | "double" | "scroll";
+export type ViewMode = "single" | "double" | "scroll" | "gallery";

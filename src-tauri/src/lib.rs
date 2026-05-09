@@ -134,6 +134,31 @@ async fn list_zip_images(zip_path: String) -> Result<Vec<String>, String> {
     .map_err(|e| e.to_string())?
 }
 
+// Returns the raw bytes of the first image in the zip (no decode/resize — done in frontend).
+#[tauri::command]
+async fn load_first_image(zip_path: String) -> Result<Response, String> {
+    let bytes = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        let file = File::open(&zip_path).map_err(|e| e.to_string())?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+
+        let mut names: Vec<String> = archive
+            .file_names()
+            .filter(|n| is_image_file(n))
+            .map(|s| s.to_string())
+            .collect();
+        names.sort_by(|a, b| natural_sort_cmp(a, b));
+
+        let first = names.into_iter().next().ok_or("no images in zip")?;
+        let mut entry = archive.by_name(&first).map_err(|e| e.to_string())?;
+        let mut bytes = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        Ok(bytes)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(Response::new(bytes))
+}
+
 #[tauri::command]
 async fn load_image(zip_path: String, name: String) -> Result<Response, String> {
     let bytes = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
@@ -156,7 +181,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_window_state::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![scan_directory, list_zip_images, load_image])
+        .invoke_handler(tauri::generate_handler![scan_directory, list_zip_images, load_image, load_first_image])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
