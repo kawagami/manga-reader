@@ -177,6 +177,8 @@ function App() {
     { code: "Numpad5",             handler: () => navigateZip(+1) },
     { code: "PageUp",              handler: () => jumpPage(-stride * 5) },
     { code: "PageDown",            handler: () => jumpPage(+stride * 5) },
+    { code: "Numpad7",             handler: () => jumpPage(-stride * 5) },
+    { code: "Numpad9",             handler: () => jumpPage(+stride * 5) },
     { code: "Numpad4",             handler: () => { if (viewMode !== "scroll") goPrev(); } },
     { code: "Numpad6",             handler: () => { if (viewMode !== "scroll") goNext(); } },
     { key: "ArrowRight",           handler: () => { if (viewMode !== "scroll") goNext(); } },
