@@ -2,9 +2,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
-use tauri::ipc::Channel;
+use tauri::ipc::Response;
 use walkdir::WalkDir;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -18,15 +17,6 @@ pub struct FolderEntry {
     pub name: String,
     pub path: String,
     pub zip_files: Vec<ZipFileEntry>,
-}
-
-#[derive(Serialize, Clone)]
-pub struct ImagePayload {
-    pub name: String,
-    pub index: usize,
-    pub total: usize,
-    pub data: String,
-    pub mime_type: String,
 }
 
 fn natural_sort_cmp(a: &str, b: &str) -> std::cmp::Ordering {
@@ -73,21 +63,6 @@ fn is_image_file(name: &str) -> bool {
             .as_deref(),
         Some("jpg") | Some("jpeg") | Some("png") | Some("webp") | Some("gif")
     )
-}
-
-fn mime_from_name(name: &str) -> String {
-    match Path::new(name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase())
-        .as_deref()
-    {
-        Some("png") => "image/png",
-        Some("webp") => "image/webp",
-        Some("gif") => "image/gif",
-        _ => "image/jpeg",
-    }
-    .to_string()
 }
 
 #[tauri::command]
@@ -142,49 +117,36 @@ fn scan_directory(path: String) -> Result<Vec<FolderEntry>, String> {
     Ok(folders)
 }
 
-// Opens the zip once, decodes each image in sorted order, pushes via channel.
-// First image arrives on the frontend as soon as it's decoded — no waiting for the full zip.
 #[tauri::command]
-async fn stream_zip_images(
-    zip_path: String,
-    on_image: Channel<ImagePayload>,
-) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+async fn list_zip_images(zip_path: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
         let file = File::open(&zip_path).map_err(|e| e.to_string())?;
-        let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
-
-        // First pass: collect image names (reads zip central directory only)
-        let mut names: Vec<String> = (0..archive.len())
-            .filter_map(|i| {
-                let entry = archive.by_index(i).ok()?;
-                let name = entry.name().to_string();
-                if is_image_file(&name) { Some(name) } else { None }
-            })
+        let archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+        let mut names: Vec<String> = archive
+            .file_names()
+            .filter(|n| is_image_file(n))
+            .map(|s| s.to_string())
             .collect();
         names.sort_by(|a, b| natural_sort_cmp(a, b));
-
-        let total = names.len();
-
-        // Second pass: decode each image and stream to frontend immediately
-        for (index, name) in names.iter().enumerate() {
-            let mut entry = archive.by_name(name).map_err(|e| e.to_string())?;
-            let mut bytes = Vec::new();
-            entry.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-
-            on_image
-                .send(ImagePayload {
-                    mime_type: mime_from_name(name),
-                    data: STANDARD.encode(&bytes),
-                    name: name.clone(),
-                    index,
-                    total,
-                })
-                .map_err(|e| e.to_string())?;
-        }
-        Ok(())
+        Ok(names)
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn load_image(zip_path: String, name: String) -> Result<Response, String> {
+    let bytes = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        let file = File::open(&zip_path).map_err(|e| e.to_string())?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+        let mut entry = archive.by_name(&name).map_err(|e| e.to_string())?;
+        let mut bytes = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        Ok(bytes)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(Response::new(bytes))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -194,7 +156,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_window_state::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![scan_directory, stream_zip_images])
+        .invoke_handler(tauri::generate_handler![scan_directory, list_zip_images, load_image])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

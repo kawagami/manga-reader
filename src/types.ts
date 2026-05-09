@@ -9,12 +9,4 @@ export interface FolderEntry {
   zip_files: ZipFileEntry[];
 }
 
-export interface ImagePayload {
-  name: string;
-  index: number;
-  total: number;
-  data: string;
-  mime_type: string;
-}
-
 export type ViewMode = "single" | "double" | "scroll";

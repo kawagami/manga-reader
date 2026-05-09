@@ -1,10 +1,19 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { invoke, Channel } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Store } from "@tauri-apps/plugin-store";
 import { restoreStateCurrent, StateFlags } from "@tauri-apps/plugin-window-state";
-import { FolderEntry, ImagePayload, ViewMode } from "./types";
+import { FolderEntry, ViewMode } from "./types";
+import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
+
+function getMimeType(name: string): string {
+  const ext = name.split(".").pop()?.toLowerCase();
+  if (ext === "png") return "image/png";
+  if (ext === "webp") return "image/webp";
+  if (ext === "gif") return "image/gif";
+  return "image/jpeg";
+}
 import { Sidebar } from "./components/Sidebar";
 import { Viewer } from "./components/Viewer";
 import "./App.css";
@@ -67,7 +76,9 @@ function App() {
   };
 
   const selectZip = useCallback(async (zipPath: string) => {
-    // Mark this zip as the active stream; previous stream messages will be ignored
+    // Revoke previous blob URLs to free memory
+    loadedRef.current.forEach((url) => URL.revokeObjectURL(url));
+
     activeZipRef.current = zipPath;
     loadedRef.current = new Map();
     setSelectedZip(zipPath);
@@ -76,27 +87,36 @@ function App() {
     setImages([]);
     setZipError(null);
 
-    const names: string[] = [];
-    const channel = new Channel<ImagePayload>();
-
-    channel.onmessage = (payload) => {
-      if (activeZipRef.current !== zipPath) return; // stale stream
-      names[payload.index] = payload.name;
-      loadedRef.current.set(
-        payload.name,
-        `data:${payload.mime_type};base64,${payload.data}`
-      );
-      setImages([...names].filter(Boolean));
-      setLoadedImages(new Map(loadedRef.current));
-    };
-
+    let names: string[];
     try {
-      await invoke("stream_zip_images", { zipPath, onImage: channel });
+      names = await invoke<string[]>("list_zip_images", { zipPath });
     } catch (e) {
-      if (activeZipRef.current === zipPath) {
-        setZipError(String(e));
-      }
+      if (activeZipRef.current === zipPath) setZipError(String(e));
+      return;
     }
+    if (activeZipRef.current !== zipPath) return;
+    setImages(names);
+
+    // Load images 4 at a time; each gets raw bytes → Blob URL (no base64)
+    const CONCURRENCY = 4;
+    let i = 0;
+    const loadNext = async () => {
+      while (i < names.length) {
+        if (activeZipRef.current !== zipPath) return;
+        const idx = i++;
+        const name = names[idx];
+        try {
+          const buffer = await invoke<ArrayBuffer>("load_image", { zipPath, name });
+          if (activeZipRef.current !== zipPath) return;
+          const url = URL.createObjectURL(new Blob([buffer], { type: getMimeType(name) }));
+          loadedRef.current.set(name, url);
+          setLoadedImages(new Map(loadedRef.current));
+        } catch (e) {
+          console.error(`load_image failed: ${name}`, e);
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: CONCURRENCY }, loadNext));
   }, []);
 
   // Drag-and-drop: folder → open as root; zip/cbz → open directly
@@ -133,39 +153,38 @@ function App() {
     setCurrentPage((p) => Math.max(p - stride, 0));
   }, [stride]);
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.code === "Numpad0") {
-        e.preventDefault();
-        const flat = folderTree.flatMap((f) => f.zip_files.map((z) => z.path));
-        if (flat.length === 0) return;
-        const pick = flat[Math.floor(Math.random() * flat.length)];
-        selectZip(pick);
-        return;
-      }
-      if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
-        e.preventDefault();
-        const flat = folderTree.flatMap((f) => f.zip_files.map((z) => z.path));
-        const idx = selectedZip ? flat.indexOf(selectedZip) : -1;
-        const next = e.key === "ArrowUp" ? idx - 1 : idx + 1;
-        if (next >= 0 && next < flat.length) selectZip(flat[next]);
-        return;
-      }
-      if (viewMode === "scroll") return;
-      if (e.key === "ArrowRight" || e.key === "ArrowDown") {
-        e.preventDefault();
-        goNext();
-      } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
-        e.preventDefault();
-        goPrev();
-      } else if (e.key === " ") {
-        e.preventDefault();
-        goNext();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [goNext, goPrev, viewMode, folderTree, selectedZip, selectZip]);
+  const flat = folderTree.flatMap((f) => f.zip_files.map((z) => z.path));
+  const zipIdx = selectedZip ? flat.indexOf(selectedZip) : -1;
+
+  const navigateZip = (delta: number) => {
+    const next = zipIdx + delta;
+    if (next >= 0 && next < flat.length) selectZip(flat[next]);
+  };
+
+  const jumpPage = (delta: number) => {
+    if (viewMode === "scroll") return;
+    setCurrentPage((p) => Math.max(0, Math.min(p + delta, images.length - 1)));
+  };
+
+  useKeyboardShortcuts([
+    { code: "Numpad0", handler: () => {
+      if (flat.length === 0) return;
+      selectZip(flat[Math.floor(Math.random() * flat.length)]);
+    }},
+    { key: "ArrowUp",   alt: true, handler: () => navigateZip(-1) },
+    { key: "ArrowDown", alt: true, handler: () => navigateZip(+1) },
+    { code: "Numpad8",             handler: () => navigateZip(-1) },
+    { code: "Numpad5",             handler: () => navigateZip(+1) },
+    { code: "PageUp",              handler: () => jumpPage(-stride * 5) },
+    { code: "PageDown",            handler: () => jumpPage(+stride * 5) },
+    { code: "Numpad4",             handler: () => { if (viewMode !== "scroll") goPrev(); } },
+    { code: "Numpad6",             handler: () => { if (viewMode !== "scroll") goNext(); } },
+    { key: "ArrowRight",           handler: () => { if (viewMode !== "scroll") goNext(); } },
+    { key: "ArrowDown",            handler: () => { if (viewMode !== "scroll") goNext(); } },
+    { key: "ArrowLeft",            handler: () => { if (viewMode !== "scroll") goPrev(); } },
+    { key: "ArrowUp",              handler: () => { if (viewMode !== "scroll") goPrev(); } },
+    { key: " ",                    handler: () => { if (viewMode !== "scroll") goNext(); } },
+  ]);
 
   const totalPages =
     viewMode === "double" ? Math.ceil(images.length / 2) : images.length;
