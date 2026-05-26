@@ -33,6 +33,7 @@ function App() {
   const [isDragOver, setIsDragOver] = useState(false);
   const [zipError, setZipError] = useState<string | null>(null);
   const [coverImages, setCoverImages] = useState<Map<string, string>>(new Map());
+  const [imgLandscape, setImgLandscape] = useState<Map<string, boolean>>(new Map());
 
   const activeZipRef = useRef<string | null>(null);
   const loadedRef = useRef<Map<string, string>>(new Map());
@@ -111,15 +112,8 @@ function App() {
   };
 
   const selectZip = useCallback(async (zipPath: string) => {
-    // Revoke previous blob URLs to free memory
-    loadedRef.current.forEach((url) => URL.revokeObjectURL(url));
-
     activeZipRef.current = zipPath;
-    loadedRef.current = new Map();
     setSelectedZip(zipPath);
-    setLoadedImages(new Map());
-    setCurrentPage(0);
-    setImages([]);
     setZipError(null);
 
     let names: string[];
@@ -130,11 +124,39 @@ function App() {
       return;
     }
     if (activeZipRef.current !== zipPath) return;
+
+    // Pre-load page 0 before swapping so viewer never shows a blank flash
+    const newLoaded = new Map<string, string>();
+    if (names.length > 0) {
+      try {
+        const buf = await invoke<ArrayBuffer>("load_image", { zipPath, name: names[0] });
+        if (activeZipRef.current !== zipPath) return;
+        newLoaded.set(names[0], URL.createObjectURL(new Blob([buf], { type: getMimeType(names[0]) })));
+      } catch {
+        // proceed without page 0 pre-loaded
+      }
+    }
+    if (activeZipRef.current !== zipPath) return;
+
+    // Pre-decode page 0 so browser has bitmap cached before DOM mount (eliminates decode flash)
+    if (newLoaded.size > 0) {
+      const preImg = new Image();
+      preImg.src = newLoaded.get(names[0])!;
+      await preImg.decode().catch(() => {});
+    }
+    if (activeZipRef.current !== zipPath) return;
+
+    // Atomic swap: revoke old URLs, show new zip starting from page 0
+    loadedRef.current.forEach((url) => URL.revokeObjectURL(url));
+    loadedRef.current = newLoaded;
+    setLoadedImages(new Map(loadedRef.current));
+    setImgLandscape(new Map());
+    setCurrentPage(0);
     setImages(names);
 
-    // Load images 4 at a time; each gets raw bytes → Blob URL (no base64)
+    // Load remaining images 4 at a time
     const CONCURRENCY = 4;
-    let i = 0;
+    let i = 1; // page 0 already loaded
     const loadNext = async () => {
       while (i < names.length) {
         if (activeZipRef.current !== zipPath) return;
@@ -179,14 +201,26 @@ function App() {
   }, [scanDir, selectZip]);
 
   const stride = viewMode === "double" ? 2 : 1;
+  // In double mode, if current page is landscape it displays as single → advance by 1 instead of 2
+  const effectiveStride =
+    viewMode === "double" && imgLandscape.get(images[currentPage]) === true ? 1 : stride;
 
   const goNext = useCallback(() => {
-    setCurrentPage((p) => Math.min(p + stride, images.length - 1));
-  }, [stride, images.length]);
+    setCurrentPage((p) => Math.min(p + effectiveStride, images.length - 1));
+  }, [effectiveStride, images.length]);
 
   const goPrev = useCallback(() => {
-    setCurrentPage((p) => Math.max(p - stride, 0));
-  }, [stride]);
+    setCurrentPage((p) => Math.max(p - effectiveStride, 0));
+  }, [effectiveStride]);
+
+  const handleOrientationLoad = useCallback((name: string, isLandscape: boolean) => {
+    setImgLandscape((prev) => {
+      if (prev.get(name) === isLandscape) return prev;
+      const next = new Map(prev);
+      next.set(name, isLandscape);
+      return next;
+    });
+  }, []);
 
   const flat = folderTree.flatMap((f) => f.zip_files.map((z) => z.path));
   const zipIdx = selectedZip ? flat.indexOf(selectedZip) : -1;
@@ -210,10 +244,10 @@ function App() {
     { key: "ArrowDown", alt: true, handler: () => navigateZip(+1) },
     { code: "Numpad8",             handler: () => navigateZip(-1) },
     { code: "Numpad5",             handler: () => navigateZip(+1) },
-    { code: "PageUp",              handler: () => jumpPage(-stride * 5) },
-    { code: "PageDown",            handler: () => jumpPage(+stride * 5) },
-    { code: "Numpad7",             handler: () => jumpPage(-stride * 5) },
-    { code: "Numpad9",             handler: () => jumpPage(+stride * 5) },
+    { code: "PageUp",              handler: () => jumpPage(-effectiveStride * 5) },
+    { code: "PageDown",            handler: () => jumpPage(+effectiveStride * 5) },
+    { code: "Numpad7",             handler: () => jumpPage(-effectiveStride * 5) },
+    { code: "Numpad9",             handler: () => jumpPage(+effectiveStride * 5) },
     { code: "Numpad4",             handler: () => { if (viewMode === "single" || viewMode === "double") goPrev(); } },
     { code: "Numpad6",             handler: () => { if (viewMode === "single" || viewMode === "double") goNext(); } },
     { key: "ArrowRight",           handler: () => { if (viewMode === "single" || viewMode === "double") goNext(); } },
@@ -290,6 +324,8 @@ function App() {
               currentPage={currentPage}
               viewMode={viewMode}
               loadedUrls={loadedImages}
+              imgLandscape={imgLandscape}
+              onOrientationLoad={handleOrientationLoad}
               error={zipError}
               zipKey={selectedZip}
             />

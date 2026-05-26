@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { ViewMode } from "../types";
 
 interface ViewerProps {
@@ -6,29 +6,18 @@ interface ViewerProps {
   currentPage: number;
   viewMode: ViewMode;
   loadedUrls: Map<string, string>;
+  imgLandscape: Map<string, boolean>;
+  onOrientationLoad: (name: string, isLandscape: boolean) => void;
   error?: string | null;
   zipKey?: string | null;
 }
 
-export function Viewer({ images, currentPage, viewMode, loadedUrls, error, zipKey }: ViewerProps) {
+export function Viewer({ images, currentPage, viewMode, loadedUrls, imgLandscape, onOrientationLoad, error, zipKey }: ViewerProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
-  const [imgLandscape, setImgLandscape] = useState<Map<string, boolean>>(new Map());
 
-  // Reset scroll and landscape cache when zip changes
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
-    setImgLandscape(new Map());
   }, [zipKey]);
-
-  const recordOrientation = (name: string, el: HTMLImageElement) => {
-    const isLandscape = el.naturalWidth > el.naturalHeight;
-    setImgLandscape((prev) => {
-      if (prev.get(name) === isLandscape) return prev;
-      const next = new Map(prev);
-      next.set(name, isLandscape);
-      return next;
-    });
-  };
 
   if (error) {
     return (
@@ -71,12 +60,12 @@ export function Viewer({ images, currentPage, viewMode, loadedUrls, error, zipKe
   }
 
   // single / double — pre-render adjacent spreads to avoid decode flicker on navigation
+  // Always anchor at currentPage so odd-index pages (after landscape stride=1 nav) are never missing
   const stride = viewMode === "double" ? 2 : 1;
   const PRELOAD = 6;
-  const renderFrom = Math.max(0, currentPage - stride * PRELOAD);
-  const renderTo = Math.min(images.length - 1, currentPage + stride * PRELOAD);
   const spreads: number[] = [];
-  for (let p = renderFrom; p <= renderTo; p += stride) spreads.push(p);
+  for (let p = currentPage; p >= 0 && currentPage - p <= stride * PRELOAD; p -= stride) spreads.unshift(p);
+  for (let p = currentPage + stride; p < images.length && p - currentPage <= stride * PRELOAD; p += stride) spreads.push(p);
 
   return (
     <div className="viewer viewer-paged">
@@ -106,7 +95,10 @@ export function Viewer({ images, currentPage, viewMode, loadedUrls, error, zipKe
                       src={url}
                       alt={name}
                       className="page-img"
-                      onLoad={(e) => recordOrientation(name, e.currentTarget)}
+                      onLoad={(e) => {
+                        const el = e.currentTarget;
+                        onOrientationLoad(name, el.naturalWidth > el.naturalHeight);
+                      }}
                     />
                   ) : (
                     <div className="page-placeholder">Loading…</div>
