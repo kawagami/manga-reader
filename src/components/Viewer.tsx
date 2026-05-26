@@ -54,28 +54,43 @@ export function Viewer({ images, currentPage, viewMode, loadedUrls, error, zipKe
     );
   }
 
-  // single / double — double is right-to-left (manga order)
-  const names =
-    viewMode === "double"
-      ? [images[currentPage + 1], images[currentPage]].filter(Boolean)
-      : [images[currentPage]].filter(Boolean);
+  // single / double — pre-render adjacent spreads to avoid decode flicker on navigation
+  const stride = viewMode === "double" ? 2 : 1;
+  const PRELOAD = 2;
+  const renderFrom = Math.max(0, currentPage - stride * PRELOAD);
+  const renderTo = Math.min(images.length - 1, currentPage + stride * PRELOAD);
+  const spreads: number[] = [];
+  for (let p = renderFrom; p <= renderTo; p += stride) spreads.push(p);
 
   return (
     <div className="viewer viewer-paged">
-      <div className="pages-wrap">
-        {names.map((name) => {
-          const url = loadedUrls.get(name);
-          return (
-            <div key={name} className="page-slot">
-              {url ? (
-                <img src={url} alt={name} className="page-img" />
-              ) : (
-                <div className="page-placeholder">Loading…</div>
-              )}
-            </div>
-          );
-        })}
-      </div>
+      {spreads.map((spreadPage) => {
+        const isActive = spreadPage === currentPage;
+        const names =
+          viewMode === "double"
+            ? [images[spreadPage + 1], images[spreadPage]].filter(Boolean)
+            : [images[spreadPage]].filter(Boolean);
+        return (
+          <div
+            key={spreadPage}
+            className="pages-wrap"
+            style={isActive ? undefined : { opacity: 0, pointerEvents: "none" }}
+          >
+            {names.map((name) => {
+              const url = loadedUrls.get(name);
+              return (
+                <div key={name} className="page-slot">
+                  {url ? (
+                    <img src={url} alt={name} className="page-img" />
+                  ) : (
+                    <div className="page-placeholder">Loading…</div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        );
+      })}
     </div>
   );
 }

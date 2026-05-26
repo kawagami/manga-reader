@@ -236,16 +236,15 @@ button:disabled {
 
 /* paged (single / double) */
 .viewer-paged {
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  position: relative;
   height: 100%;
 }
 
 .pages-wrap {
+  position: absolute;
+  inset: 0;
   display: flex;
   gap: 2px;
-  height: 100%;
   align-items: center;
   justify-content: center;
 }
