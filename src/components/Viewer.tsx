@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ViewMode } from "../types";
 
 interface ViewerProps {
@@ -12,11 +12,23 @@ interface ViewerProps {
 
 export function Viewer({ images, currentPage, viewMode, loadedUrls, error, zipKey }: ViewerProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const [imgLandscape, setImgLandscape] = useState<Map<string, boolean>>(new Map());
 
-  // Reset scroll only when zip changes, not when images are appended mid-stream
+  // Reset scroll and landscape cache when zip changes
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
+    setImgLandscape(new Map());
   }, [zipKey]);
+
+  const recordOrientation = (name: string, el: HTMLImageElement) => {
+    const isLandscape = el.naturalWidth > el.naturalHeight;
+    setImgLandscape((prev) => {
+      if (prev.get(name) === isLandscape) return prev;
+      const next = new Map(prev);
+      next.set(name, isLandscape);
+      return next;
+    });
+  };
 
   if (error) {
     return (
@@ -43,7 +55,11 @@ export function Viewer({ images, currentPage, viewMode, loadedUrls, error, zipKe
           return (
             <div key={name} className="scroll-page">
               {url ? (
-                <img src={url} alt={`Page ${idx + 1}`} className="scroll-img" />
+                <img
+                  src={url}
+                  alt={`Page ${idx + 1}`}
+                  className="scroll-img"
+                />
               ) : (
                 <div className="page-placeholder">Loading {idx + 1}…</div>
               )}
@@ -56,7 +72,7 @@ export function Viewer({ images, currentPage, viewMode, loadedUrls, error, zipKe
 
   // single / double — pre-render adjacent spreads to avoid decode flicker on navigation
   const stride = viewMode === "double" ? 2 : 1;
-  const PRELOAD = 2;
+  const PRELOAD = 6;
   const renderFrom = Math.max(0, currentPage - stride * PRELOAD);
   const renderTo = Math.min(images.length - 1, currentPage + stride * PRELOAD);
   const spreads: number[] = [];
@@ -66,10 +82,15 @@ export function Viewer({ images, currentPage, viewMode, loadedUrls, error, zipKe
     <div className="viewer viewer-paged">
       {spreads.map((spreadPage) => {
         const isActive = spreadPage === currentPage;
+
+        // In double mode, collapse to single if the lead page is landscape
+        const leadName = images[spreadPage];
+        const leadIsLandscape = viewMode === "double" && imgLandscape.get(leadName) === true;
         const names =
-          viewMode === "double"
+          viewMode === "double" && !leadIsLandscape
             ? [images[spreadPage + 1], images[spreadPage]].filter(Boolean)
             : [images[spreadPage]].filter(Boolean);
+
         return (
           <div
             key={spreadPage}
@@ -81,7 +102,12 @@ export function Viewer({ images, currentPage, viewMode, loadedUrls, error, zipKe
               return (
                 <div key={name} className="page-slot">
                   {url ? (
-                    <img src={url} alt={name} className="page-img" />
+                    <img
+                      src={url}
+                      alt={name}
+                      className="page-img"
+                      onLoad={(e) => recordOrientation(name, e.currentTarget)}
+                    />
                   ) : (
                     <div className="page-placeholder">Loading…</div>
                   )}
