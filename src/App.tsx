@@ -2,52 +2,38 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Store } from "@tauri-apps/plugin-store";
 import { restoreStateCurrent, StateFlags } from "@tauri-apps/plugin-window-state";
 import { FolderEntry, ViewMode } from "./types";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
-
-function getMimeType(name: string): string {
-  const ext = name.split(".").pop()?.toLowerCase();
-  if (ext === "png") return "image/png";
-  if (ext === "webp") return "image/webp";
-  if (ext === "gif") return "image/gif";
-  return "image/jpeg";
-}
+import { useZipLoader } from "./hooks/useZipLoader";
+import { saveSetting, loadSetting } from "./utils/store";
 import { Sidebar } from "./components/Sidebar";
 import { Viewer } from "./components/Viewer";
 import { Gallery } from "./components/Gallery";
 import "./App.css";
 
-const STORE_FILE = "settings.json";
 const KEY_LAST_DIR = "lastDir";
 const KEY_VIEW_MODE = "viewMode";
 
 function App() {
   const [folderTree, setFolderTree] = useState<FolderEntry[]>([]);
   const [selectedZip, setSelectedZip] = useState<string | null>(null);
-  const [images, setImages] = useState<string[]>([]);
   const [currentPage, setCurrentPage] = useState(0);
   const [viewMode, setViewMode] = useState<ViewMode>("single");
-  const [loadedImages, setLoadedImages] = useState<Map<string, string>>(new Map());
   const [isDragOver, setIsDragOver] = useState(false);
-  const [zipError, setZipError] = useState<string | null>(null);
   const [coverImages, setCoverImages] = useState<Map<string, string>>(new Map());
-  const [imgLandscape, setImgLandscape] = useState<Map<string, boolean>>(new Map());
 
-  const activeZipRef = useRef<string | null>(null);
-  const loadedRef = useRef<Map<string, string>>(new Map());
   const coverImagesRef = useRef<Map<string, string>>(new Map());
   const loadingCoversRef = useRef<Set<string>>(new Set());
 
+  const { images, loadedImages, imgLandscape, zipError, selectZip: loadZip, handleOrientationLoad } = useZipLoader();
+
   useEffect(() => {
     restoreStateCurrent(StateFlags.ALL).catch(() => {});
-
-    Store.load(STORE_FILE, { defaults: {} }).then(async (store) => {
-      const savedMode = await store.get<ViewMode>(KEY_VIEW_MODE);
+    (async () => {
+      const savedMode = await loadSetting<ViewMode>(KEY_VIEW_MODE);
       if (savedMode) setViewMode(savedMode);
-
-      const lastDir = await store.get<string>(KEY_LAST_DIR);
+      const lastDir = await loadSetting<string>(KEY_LAST_DIR);
       if (!lastDir) return;
       try {
         const tree = await invoke<FolderEntry[]>("scan_directory", { path: lastDir });
@@ -55,14 +41,12 @@ function App() {
       } catch {
         // dir no longer exists
       }
-    }).catch(() => {});
+    })().catch(() => {});
   }, []);
 
   const changeViewMode = useCallback(async (mode: ViewMode) => {
     setViewMode(mode);
-    const store = await Store.load(STORE_FILE, { defaults: {} });
-    await store.set(KEY_VIEW_MODE, mode);
-    await store.save();
+    await saveSetting(KEY_VIEW_MODE, mode);
   }, []);
 
   const scanDir = useCallback(async (dir: string) => {
@@ -70,12 +54,9 @@ function App() {
     coverImagesRef.current = new Map();
     loadingCoversRef.current.clear();
     setCoverImages(new Map());
-
     const tree = await invoke<FolderEntry[]>("scan_directory", { path: dir });
     setFolderTree(tree);
-    const store = await Store.load(STORE_FILE, { defaults: {} });
-    await store.set(KEY_LAST_DIR, dir);
-    await store.save();
+    await saveSetting(KEY_LAST_DIR, dir);
   }, []);
 
   const loadCover = useCallback(async (zipPath: string): Promise<void> => {
@@ -83,7 +64,6 @@ function App() {
     loadingCoversRef.current.add(zipPath);
     try {
       const buffer = await invoke<ArrayBuffer>("load_first_image", { zipPath });
-      // GPU-accelerated decode + resize via WebView2
       const bitmap = await createImageBitmap(new Blob([buffer]));
       const THUMB_W = 150;
       const THUMB_H = 200;
@@ -112,71 +92,10 @@ function App() {
   };
 
   const selectZip = useCallback(async (zipPath: string) => {
-    activeZipRef.current = zipPath;
     setSelectedZip(zipPath);
-    setZipError(null);
+    await loadZip(zipPath, () => setCurrentPage(0));
+  }, [loadZip]);
 
-    let names: string[];
-    try {
-      names = await invoke<string[]>("list_zip_images", { zipPath });
-    } catch (e) {
-      if (activeZipRef.current === zipPath) setZipError(String(e));
-      return;
-    }
-    if (activeZipRef.current !== zipPath) return;
-
-    // Pre-load page 0 before swapping so viewer never shows a blank flash
-    const newLoaded = new Map<string, string>();
-    if (names.length > 0) {
-      try {
-        const buf = await invoke<ArrayBuffer>("load_image", { zipPath, name: names[0] });
-        if (activeZipRef.current !== zipPath) return;
-        newLoaded.set(names[0], URL.createObjectURL(new Blob([buf], { type: getMimeType(names[0]) })));
-      } catch {
-        // proceed without page 0 pre-loaded
-      }
-    }
-    if (activeZipRef.current !== zipPath) return;
-
-    // Pre-decode page 0 so browser has bitmap cached before DOM mount (eliminates decode flash)
-    if (newLoaded.size > 0) {
-      const preImg = new Image();
-      preImg.src = newLoaded.get(names[0])!;
-      await preImg.decode().catch(() => {});
-    }
-    if (activeZipRef.current !== zipPath) return;
-
-    // Atomic swap: revoke old URLs, show new zip starting from page 0
-    loadedRef.current.forEach((url) => URL.revokeObjectURL(url));
-    loadedRef.current = newLoaded;
-    setLoadedImages(new Map(loadedRef.current));
-    setImgLandscape(new Map());
-    setCurrentPage(0);
-    setImages(names);
-
-    // Load remaining images 4 at a time
-    const CONCURRENCY = 4;
-    let i = 1; // page 0 already loaded
-    const loadNext = async () => {
-      while (i < names.length) {
-        if (activeZipRef.current !== zipPath) return;
-        const idx = i++;
-        const name = names[idx];
-        try {
-          const buffer = await invoke<ArrayBuffer>("load_image", { zipPath, name });
-          if (activeZipRef.current !== zipPath) return;
-          const url = URL.createObjectURL(new Blob([buffer], { type: getMimeType(name) }));
-          loadedRef.current.set(name, url);
-          setLoadedImages(new Map(loadedRef.current));
-        } catch (e) {
-          console.error(`load_image failed: ${name}`, e);
-        }
-      }
-    };
-    await Promise.all(Array.from({ length: CONCURRENCY }, loadNext));
-  }, []);
-
-  // Drag-and-drop: folder → open as root; zip/cbz → open directly
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     getCurrentWindow().onDragDropEvent((e) => {
@@ -201,7 +120,6 @@ function App() {
   }, [scanDir, selectZip]);
 
   const stride = viewMode === "double" ? 2 : 1;
-  // In double mode, if current page is landscape it displays as single → advance by 1 instead of 2
   const effectiveStride =
     viewMode === "double" && imgLandscape.get(images[currentPage]) === true ? 1 : stride;
 
@@ -212,15 +130,6 @@ function App() {
   const goPrev = useCallback(() => {
     setCurrentPage((p) => Math.max(p - effectiveStride, 0));
   }, [effectiveStride]);
-
-  const handleOrientationLoad = useCallback((name: string, isLandscape: boolean) => {
-    setImgLandscape((prev) => {
-      if (prev.get(name) === isLandscape) return prev;
-      const next = new Map(prev);
-      next.set(name, isLandscape);
-      return next;
-    });
-  }, []);
 
   const flat = folderTree.flatMap((f) => f.zip_files.map((z) => z.path));
   const zipIdx = selectedZip ? flat.indexOf(selectedZip) : -1;

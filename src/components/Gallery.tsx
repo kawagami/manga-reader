@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { FolderEntry, ZipFileEntry } from "../types";
+import { concurrentForEach } from "../utils/concurrentForEach";
 
 interface CardProps {
   zip: ZipFileEntry;
@@ -36,21 +37,9 @@ export function Gallery({ folders, coverImages, selectedZip, onSelectZip, onLoad
   const allZips = folders.flatMap((f) => f.zip_files);
 
   useEffect(() => {
-    const CONCURRENT = 2;
     const paths = folders.flatMap((f) => f.zip_files.map((z) => z.path));
-    let idx = 0;
-    let cancelled = false;
-
-    const runNext = () => {
-      if (cancelled || idx >= paths.length) return;
-      const path = paths[idx++];
-      onLoadCover(path).finally(runNext);
-    };
-
-    // Seed CONCURRENT workers
-    for (let i = 0; i < CONCURRENT; i++) runNext();
-
-    return () => { cancelled = true; };
+    const { cancel } = concurrentForEach(paths, 2, onLoadCover);
+    return cancel;
   }, [folders]);
 
   if (allZips.length === 0) {
