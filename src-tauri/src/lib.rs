@@ -1,10 +1,18 @@
 use std::collections::HashMap;
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::Path;
+use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Response;
+use tokio::sync::Semaphore;
 use walkdir::WalkDir;
+
+static THUMB_SEM: OnceLock<Semaphore> = OnceLock::new();
+fn thumb_sem() -> &'static Semaphore {
+    THUMB_SEM.get_or_init(|| Semaphore::new(4))
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ZipFileEntry {
@@ -134,6 +142,73 @@ async fn list_zip_images(zip_path: String) -> Result<Vec<String>, String> {
     .map_err(|e| e.to_string())?
 }
 
+fn thumb_cache_key(path: &str, mtime_secs: u64) -> String {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut h);
+    mtime_secs.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+// Returns a resized JPEG thumbnail (≤150×200). Cached to disk by path+mtime hash.
+#[tauri::command]
+async fn load_cover_thumb(app: tauri::AppHandle, zip_path: String) -> Result<Response, String> {
+    let _permit = thumb_sem().acquire().await.map_err(|e| e.to_string())?;
+    use tauri::Manager;
+    let cache_dir = app.path().app_cache_dir().map_err(|e| e.to_string())?;
+    let thumbs_dir = cache_dir.join("thumbs");
+
+    let bytes = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        std::fs::create_dir_all(&thumbs_dir).map_err(|e| e.to_string())?;
+
+        let mtime = std::fs::metadata(&zip_path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let key = thumb_cache_key(&zip_path, mtime);
+        let cache_file = thumbs_dir.join(format!("{}.jpg", key));
+
+        if cache_file.exists() {
+            return std::fs::read(&cache_file).map_err(|e| e.to_string());
+        }
+
+        let file = File::open(&zip_path).map_err(|e| e.to_string())?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+
+        let mut names: Vec<String> = archive
+            .file_names()
+            .filter(|n| is_image_file(n))
+            .map(|s| s.to_string())
+            .collect();
+        names.sort_by(|a, b| natural_sort_cmp(a, b));
+
+        let first = names.into_iter().next().ok_or("no images in zip")?;
+        let mut entry = archive.by_name(&first).map_err(|e| e.to_string())?;
+        let mut raw = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut raw).map_err(|e| e.to_string())?;
+
+        let img = image::load_from_memory(&raw).map_err(|e| e.to_string())?;
+        let thumb = img.thumbnail(150, 200);
+
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+                std::io::Cursor::new(&mut out), 80,
+            );
+            thumb.write_with_encoder(encoder).map_err(|e| e.to_string())?;
+        }
+
+        let _ = std::fs::write(&cache_file, &out);
+        Ok(out)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    Ok(Response::new(bytes))
+}
+
 // Returns the raw bytes of the first image in the zip (no decode/resize — done in frontend).
 #[tauri::command]
 async fn load_first_image(zip_path: String) -> Result<Response, String> {
@@ -181,7 +256,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_window_state::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![scan_directory, list_zip_images, load_image, load_first_image])
+        .invoke_handler(tauri::generate_handler![scan_directory, list_zip_images, load_image, load_first_image, load_cover_thumb])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

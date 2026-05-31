@@ -342,12 +342,8 @@ button:disabled {
 /* ── Gallery ── */
 .gallery {
   flex: 1;
-  overflow-y: auto;
+  overflow: hidden;
   padding: 16px;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  align-content: start;
   background: var(--bg);
 }
 

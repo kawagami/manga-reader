@@ -63,19 +63,8 @@ function App() {
     if (coverImagesRef.current.has(zipPath) || loadingCoversRef.current.has(zipPath)) return;
     loadingCoversRef.current.add(zipPath);
     try {
-      const buffer = await invoke<ArrayBuffer>("load_first_image", { zipPath });
-      const bitmap = await createImageBitmap(new Blob([buffer]));
-      const THUMB_W = 150;
-      const THUMB_H = 200;
-      const scale = Math.min(THUMB_W / bitmap.width, THUMB_H / bitmap.height);
-      const w = Math.round(bitmap.width * scale);
-      const h = Math.round(bitmap.height * scale);
-      const oc = new OffscreenCanvas(w, h);
-      const ctx = oc.getContext("2d")!;
-      ctx.drawImage(bitmap, 0, 0, w, h);
-      bitmap.close();
-      const blob = await oc.convertToBlob({ type: "image/jpeg", quality: 0.8 });
-      const url = URL.createObjectURL(blob);
+      const buffer = await invoke<ArrayBuffer>("load_cover_thumb", { zipPath });
+      const url = URL.createObjectURL(new Blob([buffer], { type: "image/jpeg" }));
       coverImagesRef.current.set(zipPath, url);
       setCoverImages(new Map(coverImagesRef.current));
     } catch (e) {
