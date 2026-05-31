@@ -207,7 +207,7 @@ function App() {
             folders={folderTree}
             coverImages={coverImages}
             selectedZip={selectedZip}
-            onSelectZip={(path) => { selectZip(path); changeViewMode("single"); }}
+            onSelectZip={(path) => { selectZip(path); changeViewMode("double"); }}
             onLoadCover={(path) => loadCover(path)}
           />
         ) : (
