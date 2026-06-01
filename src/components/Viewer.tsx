@@ -60,12 +60,27 @@ export function Viewer({ images, currentPage, viewMode, loadedUrls, imgLandscape
   }
 
   // single / double — pre-render adjacent spreads to avoid decode flicker on navigation
-  // Always anchor at currentPage so odd-index pages (after landscape stride=1 nav) are never missing
   const stride = viewMode === "double" ? 2 : 1;
   const PRELOAD = 6;
   const spreads: number[] = [];
-  for (let p = currentPage; p >= 0 && currentPage - p <= stride * PRELOAD; p -= stride) spreads.unshift(p);
-  for (let p = currentPage + stride; p < images.length && p - currentPage <= stride * PRELOAD; p += stride) spreads.push(p);
+
+  // Backward: include every page in range so landscape-caused odd-index pages are always covered.
+  // effectiveStride depends on each page's landscape status, so stride-2 skipping misses reachable pages.
+  const maxBack = stride * PRELOAD;
+  for (let p = Math.max(0, currentPage - maxBack); p < currentPage; p++) spreads.push(p);
+
+  spreads.push(currentPage);
+
+  // Forward: landscape-aware stride to mirror actual goNext navigation
+  {
+    let fp = currentPage;
+    for (let i = 0; i < PRELOAD; i++) {
+      const isLandscape = viewMode === "double" && imgLandscape.get(images[fp]) === true;
+      fp += isLandscape ? 1 : stride;
+      if (fp >= images.length) break;
+      spreads.push(fp);
+    }
+  }
 
   return (
     <div className="viewer viewer-paged">
