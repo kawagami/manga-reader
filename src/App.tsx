@@ -25,6 +25,7 @@ function App() {
 
   const coverImagesRef = useRef<Map<string, string>>(new Map());
   const loadingCoversRef = useRef<Set<string>>(new Set());
+  const scanGenRef = useRef(0); // bumped per root change; invalidates in-flight cover loads
 
   const { images, loadedImages, imgLandscape, zipError, selectZip: loadZip, handleOrientationLoad } = useZipLoader();
 
@@ -50,20 +51,24 @@ function App() {
   }, []);
 
   const scanDir = useCallback(async (dir: string) => {
+    // Scan first — on failure (e.g. dropped path is not a directory) current state stays intact
+    const tree = await invoke<FolderEntry[]>("scan_directory", { path: dir });
+    scanGenRef.current++;
     coverImagesRef.current.forEach((url) => URL.revokeObjectURL(url));
     coverImagesRef.current = new Map();
     loadingCoversRef.current.clear();
     setCoverImages(new Map());
-    const tree = await invoke<FolderEntry[]>("scan_directory", { path: dir });
     setFolderTree(tree);
     await saveSetting(KEY_LAST_DIR, dir);
   }, []);
 
   const loadCover = useCallback(async (zipPath: string): Promise<void> => {
     if (coverImagesRef.current.has(zipPath) || loadingCoversRef.current.has(zipPath)) return;
+    const gen = scanGenRef.current;
     loadingCoversRef.current.add(zipPath);
     try {
       const buffer = await invoke<ArrayBuffer>("load_cover_thumb", { zipPath });
+      if (gen !== scanGenRef.current) return; // root changed while loading
       const url = URL.createObjectURL(new Blob([buffer], { type: "image/jpeg" }));
       coverImagesRef.current.set(zipPath, url);
       setCoverImages(new Map(coverImagesRef.current));
@@ -128,8 +133,11 @@ function App() {
     if (next >= 0 && next < flat.length) selectZip(flat[next]);
   };
 
+  const pagedMode = viewMode === "single" || viewMode === "double";
+
+  // Returning false leaves the event to the browser (native scrolling in scroll mode)
   const jumpPage = (delta: number) => {
-    if (viewMode === "scroll" || viewMode === "gallery") return;
+    if (!pagedMode) return false;
     setCurrentPage((p) => Math.max(0, Math.min(p + delta, images.length - 1)));
   };
 
@@ -146,13 +154,13 @@ function App() {
     { code: "PageDown",            handler: () => jumpPage(+effectiveStride * 5) },
     { code: "Numpad7",             handler: () => jumpPage(-effectiveStride * 5) },
     { code: "Numpad9",             handler: () => jumpPage(+effectiveStride * 5) },
-    { code: "Numpad4",             handler: () => { if (viewMode === "single" || viewMode === "double") goPrev(); } },
-    { code: "Numpad6",             handler: () => { if (viewMode === "single" || viewMode === "double") goNext(); } },
-    { key: "ArrowRight",           handler: () => { if (viewMode === "single" || viewMode === "double") goNext(); } },
-    { key: "ArrowDown",            handler: () => { if (viewMode === "single" || viewMode === "double") goNext(); } },
-    { key: "ArrowLeft",            handler: () => { if (viewMode === "single" || viewMode === "double") goPrev(); } },
-    { key: "ArrowUp",              handler: () => { if (viewMode === "single" || viewMode === "double") goPrev(); } },
-    { key: " ",                    handler: () => { if (viewMode === "single" || viewMode === "double") goNext(); } },
+    { code: "Numpad4",             handler: () => pagedMode ? goPrev() : false },
+    { code: "Numpad6",             handler: () => pagedMode ? goNext() : false },
+    { key: "ArrowRight",           handler: () => pagedMode ? goNext() : false },
+    { key: "ArrowDown",            handler: () => pagedMode ? goNext() : false },
+    { key: "ArrowLeft",            handler: () => pagedMode ? goPrev() : false },
+    { key: "ArrowUp",              handler: () => pagedMode ? goPrev() : false },
+    { key: " ",                    handler: () => pagedMode ? goNext() : false },
   ]);
 
   const totalPages =
@@ -179,7 +187,7 @@ function App() {
           ))}
         </div>
         <div className="toolbar-spacer" />
-        {images.length > 0 && viewMode !== "scroll" && (
+        {images.length > 0 && pagedMode && (
           <div className="nav-group">
             <button className="nav-btn" onClick={goPrev} disabled={currentPage === 0}>
               ←

@@ -18,9 +18,11 @@ export function useZipLoader() {
 
   const activeZipRef = useRef<string | null>(null);
   const loadedRef = useRef<Map<string, string>>(new Map());
+  const cancelRef = useRef<(() => void) | null>(null);
 
   const selectZip = useCallback(async (zipPath: string, onSwap?: () => void) => {
     activeZipRef.current = zipPath;
+    cancelRef.current?.(); // stop previous zip's workers from claiming more pages
     setZipError(null);
 
     let names: string[];
@@ -33,6 +35,7 @@ export function useZipLoader() {
     if (activeZipRef.current !== zipPath) return;
 
     const newLoaded = new Map<string, string>();
+    const revokeNew = () => newLoaded.forEach((url) => URL.revokeObjectURL(url));
     if (names.length > 0) {
       try {
         const buf = await invoke<ArrayBuffer>("load_image", { zipPath, name: names[0] });
@@ -42,14 +45,14 @@ export function useZipLoader() {
         // proceed without page 0 pre-loaded
       }
     }
-    if (activeZipRef.current !== zipPath) return;
+    if (activeZipRef.current !== zipPath) { revokeNew(); return; }
 
     if (newLoaded.size > 0) {
       const preImg = new Image();
       preImg.src = newLoaded.get(names[0])!;
       await preImg.decode().catch(() => {});
     }
-    if (activeZipRef.current !== zipPath) return;
+    if (activeZipRef.current !== zipPath) { revokeNew(); return; }
 
     // Atomic swap: revoke old URLs, expose new zip from page 0
     loadedRef.current.forEach((url) => URL.revokeObjectURL(url));
@@ -59,7 +62,7 @@ export function useZipLoader() {
     setImages(names);
     onSwap?.();
 
-    const { done } = concurrentForEach(names.slice(1), 4, async (name) => {
+    const { done, cancel } = concurrentForEach(names.slice(1), 4, async (name) => {
       try {
         if (activeZipRef.current !== zipPath) return;
         const buffer = await invoke<ArrayBuffer>("load_image", { zipPath, name });
@@ -71,6 +74,7 @@ export function useZipLoader() {
         console.error(`load_image failed: ${name}`, e);
       }
     });
+    cancelRef.current = cancel;
     await done;
   }, []);
 

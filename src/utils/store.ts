@@ -2,8 +2,11 @@ import { Store } from "@tauri-apps/plugin-store";
 
 const STORE_FILE = "settings.json";
 
-async function getStore(): Promise<Store> {
-  return Store.load(STORE_FILE, { defaults: {} });
+let storePromise: Promise<Store> | null = null;
+
+function getStore(): Promise<Store> {
+  storePromise ??= Store.load(STORE_FILE, { defaults: {} });
+  return storePromise;
 }
 
 export async function saveSetting(key: string, value: unknown): Promise<void> {

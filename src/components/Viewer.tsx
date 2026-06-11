@@ -48,6 +48,8 @@ export function Viewer({ images, currentPage, viewMode, loadedUrls, imgLandscape
                   src={url}
                   alt={`Page ${idx + 1}`}
                   className="scroll-img"
+                  loading="lazy"
+                  decoding="async"
                 />
               ) : (
                 <div className="page-placeholder">Loading {idx + 1}…</div>

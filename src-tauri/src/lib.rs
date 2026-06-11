@@ -3,7 +3,7 @@ use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Response;
 use tokio::sync::Semaphore;
@@ -12,6 +12,34 @@ use walkdir::WalkDir;
 static THUMB_SEM: OnceLock<Semaphore> = OnceLock::new();
 fn thumb_sem() -> &'static Semaphore {
     THUMB_SEM.get_or_init(|| Semaphore::new(4))
+}
+
+// Pool of parsed archive handles for the current zip — avoids reopening the file
+// and reparsing the central directory on every load_image call. Up to 4 handles
+// (matching frontend load concurrency) so parallel reads stay parallel.
+type PooledArchive = (String, zip::ZipArchive<File>);
+static ARCHIVE_POOL: OnceLock<Mutex<Vec<PooledArchive>>> = OnceLock::new();
+fn archive_pool() -> &'static Mutex<Vec<PooledArchive>> {
+    ARCHIVE_POOL.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn take_archive(zip_path: &str) -> Result<zip::ZipArchive<File>, String> {
+    {
+        let mut pool = archive_pool().lock().unwrap();
+        if let Some(pos) = pool.iter().position(|(p, _)| p == zip_path) {
+            return Ok(pool.remove(pos).1);
+        }
+    }
+    let file = File::open(zip_path).map_err(|e| e.to_string())?;
+    zip::ZipArchive::new(file).map_err(|e| e.to_string())
+}
+
+fn return_archive(zip_path: &str, archive: zip::ZipArchive<File>) {
+    let mut pool = archive_pool().lock().unwrap();
+    pool.retain(|(p, _)| p == zip_path); // cache only the current zip
+    if pool.len() < 4 {
+        pool.push((zip_path.to_string(), archive));
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -42,13 +70,19 @@ fn natural_sort_cmp(a: &str, b: &str) -> std::cmp::Ordering {
             while b_iter.peek().map(|c| c.is_ascii_digit()).unwrap_or(false) {
                 b_num.push(b_iter.next().unwrap());
             }
-            let ord = a_num.parse::<u64>().unwrap_or(0).cmp(&b_num.parse::<u64>().unwrap_or(0));
+            // Compare digit runs as trimmed length + lexical — handles numbers
+            // beyond u64 and avoids parse
+            let a_trim = a_num.trim_start_matches('0');
+            let b_trim = b_num.trim_start_matches('0');
+            let ord = a_trim.len().cmp(&b_trim.len()).then_with(|| a_trim.cmp(b_trim));
             if ord != std::cmp::Ordering::Equal {
                 return ord;
             }
         } else {
             match (a_iter.next(), b_iter.next()) {
-                (None, None) => return std::cmp::Ordering::Equal,
+                // Full-string tiebreak keeps order deterministic when runs differ
+                // only in leading zeros ("01" vs "1")
+                (None, None) => return a.cmp(b),
                 (None, _) => return std::cmp::Ordering::Less,
                 (_, None) => return std::cmp::Ordering::Greater,
                 (Some(ac), Some(bc)) => {
@@ -74,8 +108,17 @@ fn is_image_file(name: &str) -> bool {
 }
 
 #[tauri::command]
-fn scan_directory(path: String) -> Result<Vec<FolderEntry>, String> {
-    let root = Path::new(&path);
+async fn scan_directory(path: String) -> Result<Vec<FolderEntry>, String> {
+    tauri::async_runtime::spawn_blocking(move || scan_directory_blocking(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn scan_directory_blocking(path: &str) -> Result<Vec<FolderEntry>, String> {
+    let root = Path::new(path);
+    if !root.is_dir() {
+        return Err(format!("not a directory: {}", path));
+    }
     let mut folder_map: HashMap<String, FolderEntry> = HashMap::new();
 
     for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
@@ -121,25 +164,43 @@ fn scan_directory(path: String) -> Result<Vec<FolderEntry>, String> {
     for folder in &mut folders {
         folder.zip_files.sort_by(|a, b| natural_sort_cmp(&a.name, &b.name));
     }
-    folders.sort_by(|a, b| natural_sort_cmp(&a.name, &b.name));
+    folders.sort_by(|a, b| natural_sort_cmp(&a.name, &b.name).then_with(|| a.path.cmp(&b.path)));
     Ok(folders)
 }
 
 #[tauri::command]
 async fn list_zip_images(zip_path: String) -> Result<Vec<String>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let file = File::open(&zip_path).map_err(|e| e.to_string())?;
-        let archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+        let archive = take_archive(&zip_path)?;
         let mut names: Vec<String> = archive
             .file_names()
             .filter(|n| is_image_file(n))
             .map(|s| s.to_string())
             .collect();
+        return_archive(&zip_path, archive); // prewarm pool for the load_image calls that follow
         names.sort_by(|a, b| natural_sort_cmp(a, b));
         Ok(names)
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+// Thumbs are keyed by zip path+mtime, so a changed zip leaves its old thumb
+// orphaned forever. Age-based sweep on startup; evicted thumbs regenerate on view.
+fn clean_thumb_cache(thumbs_dir: &Path) {
+    const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
+    let Some(cutoff) = std::time::SystemTime::now().checked_sub(MAX_AGE) else { return };
+    let Ok(entries) = std::fs::read_dir(thumbs_dir) else { return };
+    for entry in entries.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|t| t < cutoff)
+            .unwrap_or(false);
+        if old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn thumb_cache_key(path: &str, mtime_secs: u64) -> String {
@@ -209,39 +270,17 @@ async fn load_cover_thumb(app: tauri::AppHandle, zip_path: String) -> Result<Res
     Ok(Response::new(bytes))
 }
 
-// Returns the raw bytes of the first image in the zip (no decode/resize — done in frontend).
-#[tauri::command]
-async fn load_first_image(zip_path: String) -> Result<Response, String> {
-    let bytes = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
-        let file = File::open(&zip_path).map_err(|e| e.to_string())?;
-        let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
-
-        let mut names: Vec<String> = archive
-            .file_names()
-            .filter(|n| is_image_file(n))
-            .map(|s| s.to_string())
-            .collect();
-        names.sort_by(|a, b| natural_sort_cmp(a, b));
-
-        let first = names.into_iter().next().ok_or("no images in zip")?;
-        let mut entry = archive.by_name(&first).map_err(|e| e.to_string())?;
-        let mut bytes = Vec::with_capacity(entry.size() as usize);
-        entry.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-        Ok(bytes)
-    })
-    .await
-    .map_err(|e| e.to_string())??;
-    Ok(Response::new(bytes))
-}
-
 #[tauri::command]
 async fn load_image(zip_path: String, name: String) -> Result<Response, String> {
     let bytes = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
-        let file = File::open(&zip_path).map_err(|e| e.to_string())?;
-        let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
-        let mut entry = archive.by_name(&name).map_err(|e| e.to_string())?;
-        let mut bytes = Vec::with_capacity(entry.size() as usize);
-        entry.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        let mut archive = take_archive(&zip_path)?;
+        let bytes = {
+            let mut entry = archive.by_name(&name).map_err(|e| e.to_string())?;
+            let mut bytes = Vec::with_capacity(entry.size() as usize);
+            entry.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+            bytes
+        };
+        return_archive(&zip_path, archive);
         Ok(bytes)
     })
     .await
@@ -256,7 +295,14 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_window_state::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![scan_directory, list_zip_images, load_image, load_first_image, load_cover_thumb])
+        .setup(|app| {
+            use tauri::Manager;
+            if let Ok(cache_dir) = app.path().app_cache_dir() {
+                std::thread::spawn(move || clean_thumb_cache(&cache_dir.join("thumbs")));
+            }
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![scan_directory, list_zip_images, load_image, load_cover_thumb])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

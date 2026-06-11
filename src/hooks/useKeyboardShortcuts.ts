@@ -4,7 +4,9 @@ export interface KeyBinding {
   code?: string;  // e.code (physical key, e.g. "Numpad0", "PageUp")
   key?: string;   // e.key  (logical key, e.g. "ArrowUp", " ")
   alt?: boolean;  // require altKey pressed (default: false)
-  handler: () => void;
+  // Return false to decline the event: no preventDefault, so the browser
+  // default (e.g. native scrolling) still runs.
+  handler: () => void | boolean;
 }
 
 export function useKeyboardShortcuts(bindings: KeyBinding[]) {
@@ -19,8 +21,8 @@ export function useKeyboardShortcuts(bindings: KeyBinding[]) {
         const keyMatch = b.key === undefined || e.key === b.key;
         const hasTarget = b.code !== undefined || b.key !== undefined;
         if (hasTarget && codeMatch && keyMatch && altMatch) {
+          if (b.handler() === false) continue;
           e.preventDefault();
-          b.handler();
           return;
         }
       }
