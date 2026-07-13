@@ -7,13 +7,14 @@ interface ViewerProps {
   viewMode: ViewMode;
   loadedUrls: Map<string, string>;
   imgLandscape: Map<string, boolean>;
+  failedPages?: Set<string>; // pages whose load_image failed (negative-cached, no retry)
   onOrientationLoad: (name: string, isLandscape: boolean) => void;
   onVisiblePage?: (index: number) => void; // scroll mode: page index near viewport center
   error?: string | null;
   zipKey?: string | null;
 }
 
-export function Viewer({ images, currentPage, viewMode, loadedUrls, imgLandscape, onOrientationLoad, onVisiblePage, error, zipKey }: ViewerProps) {
+export function Viewer({ images, currentPage, viewMode, loadedUrls, imgLandscape, failedPages, onOrientationLoad, onVisiblePage, error, zipKey }: ViewerProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const rafRef = useRef(0);
 
@@ -74,6 +75,8 @@ export function Viewer({ images, currentPage, viewMode, loadedUrls, imgLandscape
                   loading="lazy"
                   decoding="async"
                 />
+              ) : failedPages?.has(name) ? (
+                <div className="page-placeholder page-failed">Failed to load page {idx + 1}</div>
               ) : (
                 <div className="page-placeholder">Loading {idx + 1}…</div>
               )}
@@ -140,6 +143,8 @@ export function Viewer({ images, currentPage, viewMode, loadedUrls, imgLandscape
                         onOrientationLoad(name, el.naturalWidth > el.naturalHeight);
                       }}
                     />
+                  ) : failedPages?.has(name) ? (
+                    <div className="page-placeholder page-failed">Failed to load</div>
                   ) : (
                     <div className="page-placeholder">Loading…</div>
                   )}

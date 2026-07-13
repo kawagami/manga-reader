@@ -295,6 +295,10 @@ button:disabled {
   background: #0d0d0d;
 }
 
+.page-failed {
+  color: #e05555;
+}
+
 /* Context menu */
 .ctx-menu {
   position: fixed;

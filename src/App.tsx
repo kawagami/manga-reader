@@ -31,12 +31,14 @@ function App() {
     noticeTimerRef.current = window.setTimeout(() => setNotice(null), 4000);
   }, []);
 
+  useEffect(() => () => window.clearTimeout(noticeTimerRef.current), []);
+
   const coverImagesRef = useRef<Map<string, string>>(new Map());
   const loadingCoversRef = useRef<Set<string>>(new Set());
   const failedCoversRef = useRef<Set<string>>(new Set()); // don't re-request broken zips on every scroll
   const scanGenRef = useRef(0); // bumped per root change; invalidates in-flight cover loads
 
-  const { images, loadedImages, imgLandscape, zipError, selectZip: loadZip, requestWindow, handleOrientationLoad } = useZipLoader();
+  const { images, loadedImages, imgLandscape, failedPages, zipError, selectZip: loadZip, requestWindow, handleOrientationLoad } = useZipLoader();
 
   // Keep the load window centered on the reading position. Scroll mode keeps
   // already-loaded pages (revoking would collapse layout above the viewport).
@@ -123,6 +125,9 @@ function App() {
   }, [selectZip, changeViewMode]);
 
   useEffect(() => {
+    // Subscription resolves async — if the effect is cleaned up first (e.g.
+    // StrictMode double-invoke), unlisten inside .then, not never
+    let cancelled = false;
     let unlisten: (() => void) | undefined;
     getCurrentWindow().onDragDropEvent((e) => {
       const p = e.payload;
@@ -141,8 +146,11 @@ function App() {
           scanDir(path).catch((err) => showNotice(`Failed to scan directory: ${err}`));
         }
       }
-    }).then((fn) => { unlisten = fn; });
-    return () => { unlisten?.(); };
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => { cancelled = true; unlisten?.(); };
   }, [scanDir, selectZip, showNotice]);
 
   const stride = viewMode === "double" ? 2 : 1;
@@ -278,6 +286,7 @@ function App() {
               viewMode={viewMode}
               loadedUrls={loadedImages}
               imgLandscape={imgLandscape}
+              failedPages={failedPages}
               onOrientationLoad={handleOrientationLoad}
               onVisiblePage={setCurrentPage}
               error={zipError}

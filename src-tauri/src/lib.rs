@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
@@ -185,6 +184,10 @@ fn scan_directory_blocking(path: &str) -> Result<Vec<FolderEntry>, String> {
 async fn list_zip_images(zip_path: String) -> Result<Vec<String>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         *current_zip().lock().unwrap() = zip_path.clone();
+        // Drop the previous zip's pooled handles now — if opening the new zip
+        // fails below, release_zip_handles(old) becomes a no-op (CURRENT_ZIP
+        // moved on) and the old file would stay locked on Windows
+        archive_pool().lock().unwrap().retain(|(p, _)| p == &zip_path);
         let archive = take_archive(&zip_path)?;
         let mut names: Vec<String> = archive
             .file_names()
@@ -218,10 +221,14 @@ fn clean_thumb_cache(thumbs_dir: &Path) {
 }
 
 fn thumb_cache_key(path: &str, mtime_secs: u64) -> String {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut h);
-    mtime_secs.hash(&mut h);
-    format!("{:016x}", h.finish())
+    // FNV-1a — DefaultHasher's algorithm isn't guaranteed stable across Rust
+    // versions, and a toolchain upgrade would silently invalidate every thumb
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in path.as_bytes().iter().chain(mtime_secs.to_le_bytes().iter()) {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:016x}", h)
 }
 
 // Returns a resized JPEG thumbnail (≤150×200). Cached to disk by path+mtime hash.
@@ -245,24 +252,26 @@ async fn load_cover_thumb(app: tauri::AppHandle, zip_path: String) -> Result<Res
             let key = thumb_cache_key(&zip_path, mtime);
             let cache_file = thumbs_dir.join(format!("{}.jpg", key));
             let cached = std::fs::read(&cache_file).ok();
+            if let Some(bytes) = &cached {
+                // Refresh mtime occasionally so frequently viewed thumbs survive
+                // the 30-day sweep (rewrite is cheap; only when >7 days old)
+                let is_stale = cache_file
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .map(|age| age > std::time::Duration::from_secs(7 * 24 * 3600))
+                    .unwrap_or(false);
+                if is_stale {
+                    let _ = std::fs::write(&cache_file, bytes);
+                }
+            }
             (cache_file, cached)
         })
         .await
         .map_err(|e| e.to_string())?
     };
     if let Some(bytes) = cached {
-        // Refresh mtime occasionally so frequently viewed thumbs survive the
-        // 30-day sweep (rewrite is cheap; only when the file is >7 days old)
-        let is_stale = cache_file
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .map(|age| age > std::time::Duration::from_secs(7 * 24 * 3600))
-            .unwrap_or(false);
-        if is_stale {
-            let _ = std::fs::write(&cache_file, &bytes);
-        }
         return Ok(Response::new(bytes));
     }
 
