@@ -290,7 +290,6 @@ function App() {
               onOrientationLoad={handleOrientationLoad}
               onVisiblePage={setCurrentPage}
               error={zipError}
-              zipKey={selectedZip}
             />
           </>
         )}

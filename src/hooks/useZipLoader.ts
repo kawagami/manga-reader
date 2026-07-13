@@ -117,6 +117,10 @@ export function useZipLoader() {
   const selectZip = useCallback(async (zipPath: string, onSwap?: () => void) => {
     activeZipRef.current = zipPath;
     queueRef.current = []; // stop previous zip's queue; in-flight guarded by activeZipRef
+    // Clear imagesRef too — until the atomic swap below, requestWindow would
+    // otherwise mix the old zip's names with the new zipPath (a scroll event
+    // during the awaits re-queues old names against the new zip)
+    imagesRef.current = [];
     failedRef.current = new Set(); // reopening a zip retries pages that failed last time
     setZipError(null);
 

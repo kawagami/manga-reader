@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 import { ViewMode } from "../types";
 
 interface ViewerProps {
@@ -11,16 +11,19 @@ interface ViewerProps {
   onOrientationLoad: (name: string, isLandscape: boolean) => void;
   onVisiblePage?: (index: number) => void; // scroll mode: page index near viewport center
   error?: string | null;
-  zipKey?: string | null;
 }
 
-export function Viewer({ images, currentPage, viewMode, loadedUrls, imgLandscape, failedPages, onOrientationLoad, onVisiblePage, error, zipKey }: ViewerProps) {
+export function Viewer({ images, currentPage, viewMode, loadedUrls, imgLandscape, failedPages, onOrientationLoad, onVisiblePage, error }: ViewerProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const rafRef = useRef(0);
 
-  useEffect(() => {
+  // Reset scroll when the page list swaps (new zip), not when the sidebar
+  // selection changes — selection updates before the load finishes, and
+  // resetting then scrolls the still-visible old zip to the top. Layout
+  // effect: reset must land before the new pages paint.
+  useLayoutEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
-  }, [zipKey]);
+  }, [images]);
 
   useEffect(() => () => cancelAnimationFrame(rafRef.current), []);
 

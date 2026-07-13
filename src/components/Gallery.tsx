@@ -65,9 +65,18 @@ interface Props {
 
 export function Gallery({ folders, coverImages, selectedZip, onSelectZip, onLoadCover }: Props) {
   const allZips = useMemo(() => folders.flatMap((f) => f.zip_files), [folders]);
-  const [containerWidth, setContainerWidth] = useState(800);
+  // null until the container mounts — rendering the grid with a guessed width
+  // would flash a wrong column count on first paint. Callback ref measures
+  // during commit (before paint); Grid's onResize handles later resizes.
+  const [containerWidth, setContainerWidth] = useState<number | null>(null);
+  const measureRef = useCallback((el: HTMLDivElement | null) => {
+    if (!el) return;
+    // Grid fills the content box; clientWidth includes padding
+    const cs = getComputedStyle(el);
+    setContainerWidth(el.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight));
+  }, []);
 
-  const cols = Math.max(1, Math.floor(containerWidth / COL_W));
+  const cols = Math.max(1, Math.floor((containerWidth ?? COL_W) / COL_W));
   const rows = Math.ceil(allZips.length / cols);
 
   const handleResize = useCallback(({ width }: { width: number; height: number }) => {
@@ -100,19 +109,21 @@ export function Gallery({ folders, coverImages, selectedZip, onSelectZip, onLoad
   }
 
   return (
-    <div className="gallery">
-      <Grid
-        columnCount={cols}
-        rowCount={rows}
-        columnWidth={COL_W}
-        rowHeight={ROW_H}
-        overscanCount={2}
-        cellComponent={GridCell}
-        cellProps={cellProps}
-        onResize={handleResize}
-        onCellsRendered={handleCellsRendered}
-        style={{ height: "100%", width: "100%" }}
-      />
+    <div className="gallery" ref={measureRef}>
+      {containerWidth !== null && (
+        <Grid
+          columnCount={cols}
+          rowCount={rows}
+          columnWidth={COL_W}
+          rowHeight={ROW_H}
+          overscanCount={2}
+          cellComponent={GridCell}
+          cellProps={cellProps}
+          onResize={handleResize}
+          onCellsRendered={handleCellsRendered}
+          style={{ height: "100%", width: "100%" }}
+        />
+      )}
     </div>
   );
 }

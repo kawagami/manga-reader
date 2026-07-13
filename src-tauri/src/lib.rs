@@ -105,6 +105,13 @@ fn natural_sort_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
+// Pre-allocation hint for reading a zip entry. The size in the central
+// directory is attacker-controlled (a corrupt/malicious zip can claim
+// gigabytes), so cap it — read_to_end grows the Vec as needed anyway.
+fn alloc_hint(claimed: u64) -> usize {
+    claimed.min(64 * 1024 * 1024) as usize
+}
+
 fn is_image_file(name: &str) -> bool {
     matches!(
         Path::new(name)
@@ -292,7 +299,7 @@ async fn load_cover_thumb(app: tauri::AppHandle, zip_path: String) -> Result<Res
 
         let first = names.into_iter().next().ok_or("no images in zip")?;
         let mut entry = archive.by_name(&first).map_err(|e| e.to_string())?;
-        let mut raw = Vec::with_capacity(entry.size() as usize);
+        let mut raw = Vec::with_capacity(alloc_hint(entry.size()));
         entry.read_to_end(&mut raw).map_err(|e| e.to_string())?;
 
         let img = image::load_from_memory(&raw).map_err(|e| e.to_string())?;
@@ -321,7 +328,7 @@ async fn load_image(zip_path: String, name: String) -> Result<Response, String> 
         let mut archive = take_archive(&zip_path)?;
         let bytes = {
             let mut entry = archive.by_name(&name).map_err(|e| e.to_string())?;
-            let mut bytes = Vec::with_capacity(entry.size() as usize);
+            let mut bytes = Vec::with_capacity(alloc_hint(entry.size()));
             entry.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
             bytes
         };
