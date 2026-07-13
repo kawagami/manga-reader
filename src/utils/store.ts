@@ -5,7 +5,12 @@ const STORE_FILE = "settings.json";
 let storePromise: Promise<Store> | null = null;
 
 function getStore(): Promise<Store> {
-  storePromise ??= Store.load(STORE_FILE, { defaults: {} });
+  // Reset on failure so the next call retries instead of returning a
+  // permanently rejected promise
+  storePromise ??= Store.load(STORE_FILE, { defaults: {} }).catch((e) => {
+    storePromise = null;
+    throw e;
+  });
   return storePromise;
 }
 

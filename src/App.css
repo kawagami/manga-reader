@@ -403,6 +403,23 @@ button:disabled {
   color: var(--text);
 }
 
+/* Transient error toast */
+.toast {
+  position: fixed;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 110;
+  max-width: 70vw;
+  padding: 8px 14px;
+  border-radius: 6px;
+  background: #3a1d1d;
+  border: 1px solid #a94442;
+  color: #f0c0c0;
+  font-size: 13px;
+  pointer-events: none;
+}
+
 /* Drag-over overlay */
 .drag-overlay {
   position: fixed;

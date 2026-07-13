@@ -22,12 +22,27 @@ function App() {
   const [viewMode, setViewMode] = useState<ViewMode>("single");
   const [isDragOver, setIsDragOver] = useState(false);
   const [coverImages, setCoverImages] = useState<Map<string, string>>(new Map());
+  const [notice, setNotice] = useState<string | null>(null);
+  const noticeTimerRef = useRef<number | undefined>(undefined);
+
+  const showNotice = useCallback((msg: string) => {
+    setNotice(msg);
+    window.clearTimeout(noticeTimerRef.current);
+    noticeTimerRef.current = window.setTimeout(() => setNotice(null), 4000);
+  }, []);
 
   const coverImagesRef = useRef<Map<string, string>>(new Map());
   const loadingCoversRef = useRef<Set<string>>(new Set());
+  const failedCoversRef = useRef<Set<string>>(new Set()); // don't re-request broken zips on every scroll
   const scanGenRef = useRef(0); // bumped per root change; invalidates in-flight cover loads
 
-  const { images, loadedImages, imgLandscape, zipError, selectZip: loadZip, handleOrientationLoad } = useZipLoader();
+  const { images, loadedImages, imgLandscape, zipError, selectZip: loadZip, requestWindow, handleOrientationLoad } = useZipLoader();
+
+  // Keep the load window centered on the reading position. Scroll mode keeps
+  // already-loaded pages (revoking would collapse layout above the viewport).
+  useEffect(() => {
+    if (images.length > 0) requestWindow(currentPage, viewMode !== "scroll");
+  }, [currentPage, viewMode, images, requestWindow]);
 
   useEffect(() => {
     restoreStateCurrent(StateFlags.ALL).catch(() => {});
@@ -45,9 +60,9 @@ function App() {
     })().catch(() => {});
   }, []);
 
-  const changeViewMode = useCallback(async (mode: ViewMode) => {
+  const changeViewMode = useCallback((mode: ViewMode) => {
     setViewMode(mode);
-    await saveSetting(KEY_VIEW_MODE, mode);
+    saveSetting(KEY_VIEW_MODE, mode).catch(console.error);
   }, []);
 
   const scanDir = useCallback(async (dir: string) => {
@@ -57,13 +72,18 @@ function App() {
     coverImagesRef.current.forEach((url) => URL.revokeObjectURL(url));
     coverImagesRef.current = new Map();
     loadingCoversRef.current.clear();
+    failedCoversRef.current.clear();
     setCoverImages(new Map());
     setFolderTree(tree);
     await saveSetting(KEY_LAST_DIR, dir);
   }, []);
 
   const loadCover = useCallback(async (zipPath: string): Promise<void> => {
-    if (coverImagesRef.current.has(zipPath) || loadingCoversRef.current.has(zipPath)) return;
+    if (
+      coverImagesRef.current.has(zipPath) ||
+      loadingCoversRef.current.has(zipPath) ||
+      failedCoversRef.current.has(zipPath)
+    ) return;
     const gen = scanGenRef.current;
     loadingCoversRef.current.add(zipPath);
     try {
@@ -74,6 +94,7 @@ function App() {
       setCoverImages(new Map(coverImagesRef.current));
     } catch (e) {
       console.error(`loadCover failed: ${zipPath}`, e);
+      if (gen === scanGenRef.current) failedCoversRef.current.add(zipPath);
     } finally {
       loadingCoversRef.current.delete(zipPath);
     }
@@ -82,13 +103,24 @@ function App() {
   const selectRoot = async () => {
     const dir = await open({ directory: true, multiple: false });
     if (!dir || typeof dir !== "string") return;
-    try { await scanDir(dir); } catch (e) { console.error(e); }
+    try {
+      await scanDir(dir);
+    } catch (e) {
+      console.error(e);
+      showNotice(`Failed to scan directory: ${e}`);
+    }
   };
 
   const selectZip = useCallback(async (zipPath: string) => {
     setSelectedZip(zipPath);
     await loadZip(zipPath, () => setCurrentPage(0));
   }, [loadZip]);
+
+  // Stable identity so Gallery cells don't re-render on every App render
+  const openFromGallery = useCallback((path: string) => {
+    selectZip(path);
+    changeViewMode("double");
+  }, [selectZip, changeViewMode]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -106,19 +138,26 @@ function App() {
         if (lower.endsWith(".zip") || lower.endsWith(".cbz")) {
           selectZip(path);
         } else {
-          scanDir(path).catch(() => {});
+          scanDir(path).catch((err) => showNotice(`Failed to scan directory: ${err}`));
         }
       }
     }).then((fn) => { unlisten = fn; });
     return () => { unlisten?.(); };
-  }, [scanDir, selectZip]);
+  }, [scanDir, selectZip, showNotice]);
 
   const stride = viewMode === "double" ? 2 : 1;
   const effectiveStride =
     viewMode === "double" && imgLandscape.get(images[currentPage]) === true ? 1 : stride;
 
+  // Advance only if the next spread starts on a real page — stops the last
+  // spread from re-showing its final page alone in double mode
+  const canGoNext = currentPage + effectiveStride <= images.length - 1;
+
   const goNext = useCallback(() => {
-    setCurrentPage((p) => Math.min(p + effectiveStride, images.length - 1));
+    setCurrentPage((p) => {
+      const next = p + effectiveStride;
+      return next <= images.length - 1 ? next : p;
+    });
   }, [effectiveStride, images.length]);
 
   const goPrev = useCallback(() => {
@@ -128,9 +167,16 @@ function App() {
   const flat = folderTree.flatMap((f) => f.zip_files.map((z) => z.path));
   const zipIdx = selectedZip ? flat.indexOf(selectedZip) : -1;
 
+  // In gallery mode a keyboard-opened zip has no visible viewer — switch to
+  // double mode (same as clicking a card) instead of loading invisibly
+  const openZip = (path: string) => {
+    selectZip(path);
+    if (viewMode === "gallery") changeViewMode("double");
+  };
+
   const navigateZip = (delta: number) => {
     const next = zipIdx + delta;
-    if (next >= 0 && next < flat.length) selectZip(flat[next]);
+    if (next >= 0 && next < flat.length) openZip(flat[next]);
   };
 
   const pagedMode = viewMode === "single" || viewMode === "double";
@@ -144,7 +190,7 @@ function App() {
   useKeyboardShortcuts([
     { code: "Numpad0", handler: () => {
       if (flat.length === 0) return;
-      selectZip(flat[Math.floor(Math.random() * flat.length)]);
+      openZip(flat[Math.floor(Math.random() * flat.length)]);
     }},
     { key: "ArrowUp",   alt: true, handler: () => navigateZip(-1) },
     { key: "ArrowDown", alt: true, handler: () => navigateZip(+1) },
@@ -163,14 +209,17 @@ function App() {
     { key: " ",                    handler: () => pagedMode ? goNext() : false },
   ]);
 
-  const totalPages =
-    viewMode === "double" ? Math.ceil(images.length / 2) : images.length;
-  const displayPage =
-    viewMode === "double" ? Math.floor(currentPage / 2) + 1 : currentPage + 1;
+  // Real page numbers — spread math drifts once a landscape page shifts parity
+  const spreadLast = Math.min(currentPage + effectiveStride, images.length);
+  const pageLabel =
+    spreadLast > currentPage + 1
+      ? `${currentPage + 1}–${spreadLast} / ${images.length}`
+      : `${currentPage + 1} / ${images.length}`;
 
   return (
     <div className="app">
       {isDragOver && <div className="drag-overlay">Drop folder or zip to open</div>}
+      {notice && <div className="toast">{notice}</div>}
       <div className="toolbar">
         <button className="btn-primary" onClick={selectRoot}>
           Open Directory
@@ -192,13 +241,11 @@ function App() {
             <button className="nav-btn" onClick={goPrev} disabled={currentPage === 0}>
               ←
             </button>
-            <span className="page-info">
-              {displayPage} / {totalPages}
-            </span>
+            <span className="page-info">{pageLabel}</span>
             <button
               className="nav-btn"
               onClick={goNext}
-              disabled={currentPage >= images.length - 1}
+              disabled={!canGoNext}
             >
               →
             </button>
@@ -215,8 +262,8 @@ function App() {
             folders={folderTree}
             coverImages={coverImages}
             selectedZip={selectedZip}
-            onSelectZip={(path) => { selectZip(path); changeViewMode("double"); }}
-            onLoadCover={(path) => loadCover(path)}
+            onSelectZip={openFromGallery}
+            onLoadCover={loadCover}
           />
         ) : (
           <>
@@ -232,6 +279,7 @@ function App() {
               loadedUrls={loadedImages}
               imgLandscape={imgLandscape}
               onOrientationLoad={handleOrientationLoad}
+              onVisiblePage={setCurrentPage}
               error={zipError}
               zipKey={selectedZip}
             />

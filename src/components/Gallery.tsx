@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { CSSProperties } from "react";
 import { CellComponentProps, Grid } from "react-window";
 import { FolderEntry, ZipFileEntry } from "../types";
@@ -64,7 +64,7 @@ interface Props {
 }
 
 export function Gallery({ folders, coverImages, selectedZip, onSelectZip, onLoadCover }: Props) {
-  const allZips = folders.flatMap((f) => f.zip_files);
+  const allZips = useMemo(() => folders.flatMap((f) => f.zip_files), [folders]);
   const [containerWidth, setContainerWidth] = useState(800);
 
   const cols = Math.max(1, Math.floor(containerWidth / COL_W));
@@ -86,7 +86,10 @@ export function Gallery({ folders, coverImages, selectedZip, onSelectZip, onLoad
     }
   }, [cols, allZips, onLoadCover]);
 
-  const cellProps: MyCellProps = { allZips, cols, coverImages, selectedZip, onSelectZip };
+  const cellProps: MyCellProps = useMemo(
+    () => ({ allZips, cols, coverImages, selectedZip, onSelectZip }),
+    [allZips, cols, coverImages, selectedZip, onSelectZip],
+  );
 
   if (allZips.length === 0) {
     return (

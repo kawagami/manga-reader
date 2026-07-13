@@ -8,16 +8,39 @@ interface ViewerProps {
   loadedUrls: Map<string, string>;
   imgLandscape: Map<string, boolean>;
   onOrientationLoad: (name: string, isLandscape: boolean) => void;
+  onVisiblePage?: (index: number) => void; // scroll mode: page index near viewport center
   error?: string | null;
   zipKey?: string | null;
 }
 
-export function Viewer({ images, currentPage, viewMode, loadedUrls, imgLandscape, onOrientationLoad, error, zipKey }: ViewerProps) {
+export function Viewer({ images, currentPage, viewMode, loadedUrls, imgLandscape, onOrientationLoad, onVisiblePage, error, zipKey }: ViewerProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const rafRef = useRef(0);
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
   }, [zipKey]);
+
+  useEffect(() => () => cancelAnimationFrame(rafRef.current), []);
+
+  // Report which page sits at the viewport center so the loader can keep the
+  // window around the reading position (rAF-throttled)
+  const handleScroll = () => {
+    cancelAnimationFrame(rafRef.current);
+    rafRef.current = requestAnimationFrame(() => {
+      const el = scrollRef.current;
+      if (!el || !onVisiblePage) return;
+      const mid = el.scrollTop + el.clientHeight / 2;
+      const children = el.children;
+      for (let i = 0; i < children.length; i++) {
+        const c = children[i] as HTMLElement;
+        if (c.offsetTop + c.offsetHeight >= mid) {
+          onVisiblePage(i);
+          return;
+        }
+      }
+    });
+  };
 
   if (error) {
     return (
@@ -38,7 +61,7 @@ export function Viewer({ images, currentPage, viewMode, loadedUrls, imgLandscape
 
   if (viewMode === "scroll") {
     return (
-      <div className="viewer viewer-scroll" ref={scrollRef}>
+      <div className="viewer viewer-scroll" ref={scrollRef} onScroll={handleScroll}>
         {images.map((name, idx) => {
           const url = loadedUrls.get(name);
           return (

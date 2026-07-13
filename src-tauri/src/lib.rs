@@ -23,6 +23,13 @@ fn archive_pool() -> &'static Mutex<Vec<PooledArchive>> {
     ARCHIVE_POOL.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+// Path of the zip currently being read; set by list_zip_images. A stale
+// load_image finishing after a zip switch must not flush the new zip's pool.
+static CURRENT_ZIP: OnceLock<Mutex<String>> = OnceLock::new();
+fn current_zip() -> &'static Mutex<String> {
+    CURRENT_ZIP.get_or_init(|| Mutex::new(String::new()))
+}
+
 fn take_archive(zip_path: &str) -> Result<zip::ZipArchive<File>, String> {
     {
         let mut pool = archive_pool().lock().unwrap();
@@ -30,11 +37,14 @@ fn take_archive(zip_path: &str) -> Result<zip::ZipArchive<File>, String> {
             return Ok(pool.remove(pos).1);
         }
     }
-    let file = File::open(zip_path).map_err(|e| e.to_string())?;
-    zip::ZipArchive::new(file).map_err(|e| e.to_string())
+    let file = File::open(zip_path).map_err(|e| format!("{}: {}", zip_path, e))?;
+    zip::ZipArchive::new(file).map_err(|e| format!("{}: {}", zip_path, e))
 }
 
 fn return_archive(zip_path: &str, archive: zip::ZipArchive<File>) {
+    if *current_zip().lock().unwrap() != zip_path {
+        return; // stale handle from a previous zip — drop it
+    }
     let mut pool = archive_pool().lock().unwrap();
     pool.retain(|(p, _)| p == zip_path); // cache only the current zip
     if pool.len() < 4 {
@@ -103,7 +113,10 @@ fn is_image_file(name: &str) -> bool {
             .and_then(|e| e.to_str())
             .map(|e| e.to_lowercase())
             .as_deref(),
+        // avif decodes in the webview; cover thumbs for avif may fail (image
+        // crate needs a native decoder) and fall back to the placeholder
         Some("jpg") | Some("jpeg") | Some("png") | Some("webp") | Some("gif")
+            | Some("bmp") | Some("avif")
     )
 }
 
@@ -171,6 +184,7 @@ fn scan_directory_blocking(path: &str) -> Result<Vec<FolderEntry>, String> {
 #[tauri::command]
 async fn list_zip_images(zip_path: String) -> Result<Vec<String>, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        *current_zip().lock().unwrap() = zip_path.clone();
         let archive = take_archive(&zip_path)?;
         let mut names: Vec<String> = archive
             .file_names()
@@ -213,29 +227,51 @@ fn thumb_cache_key(path: &str, mtime_secs: u64) -> String {
 // Returns a resized JPEG thumbnail (≤150×200). Cached to disk by path+mtime hash.
 #[tauri::command]
 async fn load_cover_thumb(app: tauri::AppHandle, zip_path: String) -> Result<Response, String> {
-    let _permit = thumb_sem().acquire().await.map_err(|e| e.to_string())?;
     use tauri::Manager;
     let cache_dir = app.path().app_cache_dir().map_err(|e| e.to_string())?;
     let thumbs_dir = cache_dir.join("thumbs");
 
+    // Cache check first — hits shouldn't queue behind slow decode jobs
+    let (cache_file, cached) = {
+        let zip_path = zip_path.clone();
+        let thumbs_dir = thumbs_dir.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let mtime = std::fs::metadata(&zip_path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let key = thumb_cache_key(&zip_path, mtime);
+            let cache_file = thumbs_dir.join(format!("{}.jpg", key));
+            let cached = std::fs::read(&cache_file).ok();
+            (cache_file, cached)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    };
+    if let Some(bytes) = cached {
+        // Refresh mtime occasionally so frequently viewed thumbs survive the
+        // 30-day sweep (rewrite is cheap; only when the file is >7 days old)
+        let is_stale = cache_file
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|age| age > std::time::Duration::from_secs(7 * 24 * 3600))
+            .unwrap_or(false);
+        if is_stale {
+            let _ = std::fs::write(&cache_file, &bytes);
+        }
+        return Ok(Response::new(bytes));
+    }
+
+    let _permit = thumb_sem().acquire().await.map_err(|e| e.to_string())?;
+
     let bytes = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
         std::fs::create_dir_all(&thumbs_dir).map_err(|e| e.to_string())?;
 
-        let mtime = std::fs::metadata(&zip_path)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        let key = thumb_cache_key(&zip_path, mtime);
-        let cache_file = thumbs_dir.join(format!("{}.jpg", key));
-
-        if cache_file.exists() {
-            return std::fs::read(&cache_file).map_err(|e| e.to_string());
-        }
-
-        let file = File::open(&zip_path).map_err(|e| e.to_string())?;
+        let file = File::open(&zip_path).map_err(|e| format!("{}: {}", zip_path, e))?;
         let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
 
         let mut names: Vec<String> = archive
@@ -288,6 +324,17 @@ async fn load_image(zip_path: String, name: String) -> Result<Response, String> 
     Ok(Response::new(bytes))
 }
 
+// Called by the frontend whenever its load queue drains. Idle pooled handles
+// lock the zip file on Windows (blocks delete/rename in Explorer). CURRENT_ZIP
+// stays set so the pool re-warms on the next load burst for the same zip.
+#[tauri::command]
+fn release_zip_handles(zip_path: String) {
+    if *current_zip().lock().unwrap() != zip_path {
+        return; // another zip is already loading; leave its pool alone
+    }
+    archive_pool().lock().unwrap().clear();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -302,7 +349,7 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![scan_directory, list_zip_images, load_image, load_cover_thumb])
+        .invoke_handler(tauri::generate_handler![scan_directory, list_zip_images, load_image, load_cover_thumb, release_zip_handles])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
