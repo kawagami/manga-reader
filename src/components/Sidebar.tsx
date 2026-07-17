@@ -18,6 +18,7 @@ export function Sidebar({ folders, selectedZip, onSelectZip }: SidebarProps) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [ctxMenu, setCtxMenu] = useState<ContextMenu | null>(null);
   const sidebarRef = useRef<HTMLDivElement>(null);
+  const scrolledZipRef = useRef<string | null>(null);
 
   // Auto-expand the folder that contains the newly selected zip
   useEffect(() => {
@@ -34,11 +35,15 @@ export function Sidebar({ folders, selectedZip, onSelectZip }: SidebarProps) {
     });
   }, [selectedZip, folders]);
 
-  // Scroll selected item into view after expansion renders
+  // Scroll selected item into view after expansion renders.
+  // `expanded` is in deps so this fires after auto-expand, but guard with
+  // scrolledZipRef so manual folder toggles don't re-scroll to the selection.
   useEffect(() => {
-    if (!selectedZip) return;
+    if (!selectedZip || scrolledZipRef.current === selectedZip) return;
     const el = sidebarRef.current?.querySelector<HTMLElement>("[data-selected]");
-    el?.scrollIntoView({ block: "nearest" });
+    if (!el) return;
+    el.scrollIntoView({ block: "nearest" });
+    scrolledZipRef.current = selectedZip;
   }, [selectedZip, expanded]);
 
   // Dismiss context menu on outside click
