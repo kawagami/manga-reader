@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -6,7 +6,9 @@ import { restoreStateCurrent, StateFlags } from "@tauri-apps/plugin-window-state
 import { FolderEntry, ViewMode } from "./types";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useZipLoader } from "./hooks/useZipLoader";
+import { useCoverLoader } from "./hooks/useCoverLoader";
 import { saveSetting, loadSetting } from "./utils/store";
+import { spreadStride } from "./utils/spread";
 import { Sidebar } from "./components/Sidebar";
 import { Viewer } from "./components/Viewer";
 import { Gallery } from "./components/Gallery";
@@ -21,7 +23,6 @@ function App() {
   const [currentPage, setCurrentPage] = useState(0);
   const [viewMode, setViewMode] = useState<ViewMode>("single");
   const [isDragOver, setIsDragOver] = useState(false);
-  const [coverImages, setCoverImages] = useState<Map<string, string>>(new Map());
   const [notice, setNotice] = useState<string | null>(null);
   const noticeTimerRef = useRef<number | undefined>(undefined);
 
@@ -33,18 +34,17 @@ function App() {
 
   useEffect(() => () => window.clearTimeout(noticeTimerRef.current), []);
 
-  const coverImagesRef = useRef<Map<string, string>>(new Map());
-  const loadingCoversRef = useRef<Set<string>>(new Set());
-  const failedCoversRef = useRef<Set<string>>(new Set()); // don't re-request broken zips on every scroll
-  const scanGenRef = useRef(0); // bumped per root change; invalidates in-flight cover loads
-
-  const { images, loadedImages, imgLandscape, failedPages, zipError, selectZip: loadZip, requestWindow, handleOrientationLoad } = useZipLoader();
-
-  // Keep the load window centered on the reading position. Scroll mode keeps
-  // already-loaded pages (revoking would collapse layout above the viewport).
-  useEffect(() => {
-    if (images.length > 0) requestWindow(currentPage, viewMode !== "scroll");
-  }, [currentPage, viewMode, images, requestWindow]);
+  const { covers, loadCover, resetCovers } = useCoverLoader();
+  const {
+    images,
+    imgLandscape,
+    failedPages,
+    zipError,
+    selectZip: loadZip,
+    handleOrientationLoad,
+    handlePageError,
+    srcFor,
+  } = useZipLoader();
 
   useEffect(() => {
     restoreStateCurrent(StateFlags.ALL).catch(() => {});
@@ -67,40 +67,16 @@ function App() {
     saveSetting(KEY_VIEW_MODE, mode).catch(console.error);
   }, []);
 
-  const scanDir = useCallback(async (dir: string) => {
-    // Scan first — on failure (e.g. dropped path is not a directory) current state stays intact
-    const tree = await invoke<FolderEntry[]>("scan_directory", { path: dir });
-    scanGenRef.current++;
-    coverImagesRef.current.forEach((url) => URL.revokeObjectURL(url));
-    coverImagesRef.current = new Map();
-    loadingCoversRef.current.clear();
-    failedCoversRef.current.clear();
-    setCoverImages(new Map());
-    setFolderTree(tree);
-    await saveSetting(KEY_LAST_DIR, dir);
-  }, []);
-
-  const loadCover = useCallback(async (zipPath: string): Promise<void> => {
-    if (
-      coverImagesRef.current.has(zipPath) ||
-      loadingCoversRef.current.has(zipPath) ||
-      failedCoversRef.current.has(zipPath)
-    ) return;
-    const gen = scanGenRef.current;
-    loadingCoversRef.current.add(zipPath);
-    try {
-      const buffer = await invoke<ArrayBuffer>("load_cover_thumb", { zipPath });
-      if (gen !== scanGenRef.current) return; // root changed while loading
-      const url = URL.createObjectURL(new Blob([buffer], { type: "image/jpeg" }));
-      coverImagesRef.current.set(zipPath, url);
-      setCoverImages(new Map(coverImagesRef.current));
-    } catch (e) {
-      console.error(`loadCover failed: ${zipPath}`, e);
-      if (gen === scanGenRef.current) failedCoversRef.current.add(zipPath);
-    } finally {
-      loadingCoversRef.current.delete(zipPath);
-    }
-  }, []);
+  const scanDir = useCallback(
+    async (dir: string) => {
+      // Scan first — on failure (e.g. dropped path is not a directory) current state stays intact
+      const tree = await invoke<FolderEntry[]>("scan_directory", { path: dir });
+      resetCovers();
+      setFolderTree(tree);
+      await saveSetting(KEY_LAST_DIR, dir);
+    },
+    [resetCovers],
+  );
 
   const selectRoot = async () => {
     const dir = await open({ directory: true, multiple: false });
@@ -153,9 +129,7 @@ function App() {
     return () => { cancelled = true; unlisten?.(); };
   }, [scanDir, selectZip, showNotice]);
 
-  const stride = viewMode === "double" ? 2 : 1;
-  const effectiveStride =
-    viewMode === "double" && imgLandscape.get(images[currentPage]) === true ? 1 : stride;
+  const effectiveStride = spreadStride(images, imgLandscape, currentPage, viewMode === "double");
 
   // Advance only if the next spread starts on a real page — stops the last
   // spread from re-showing its final page alone in double mode
@@ -172,8 +146,14 @@ function App() {
     setCurrentPage((p) => Math.max(p - effectiveStride, 0));
   }, [effectiveStride]);
 
-  const flat = folderTree.flatMap((f) => f.zip_files.map((z) => z.path));
-  const zipIdx = selectedZip ? flat.indexOf(selectedZip) : -1;
+  // Rebuilt only when the tree changes — this used to flatMap + indexOf on
+  // every render, which is O(zips) per keystroke on a large library
+  const flat = useMemo(
+    () => folderTree.flatMap((f) => f.zip_files.map((z) => z.path)),
+    [folderTree],
+  );
+  const zipIndex = useMemo(() => new Map(flat.map((p, i) => [p, i])), [flat]);
+  const zipIdx = selectedZip ? zipIndex.get(selectedZip) ?? -1 : -1;
 
   // In gallery mode a keyboard-opened zip has no visible viewer — switch to
   // double mode (same as clicking a card) instead of loading invisibly
@@ -268,7 +248,7 @@ function App() {
         {viewMode === "gallery" ? (
           <Gallery
             folders={folderTree}
-            coverImages={coverImages}
+            coverImages={covers}
             selectedZip={selectedZip}
             onSelectZip={openFromGallery}
             onLoadCover={loadCover}
@@ -284,10 +264,11 @@ function App() {
               images={images}
               currentPage={currentPage}
               viewMode={viewMode}
-              loadedUrls={loadedImages}
+              srcFor={srcFor}
               imgLandscape={imgLandscape}
               failedPages={failedPages}
               onOrientationLoad={handleOrientationLoad}
+              onPageError={handlePageError}
               onVisiblePage={setCurrentPage}
               error={zipError}
             />

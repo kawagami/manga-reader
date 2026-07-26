@@ -1,21 +1,33 @@
-import { useEffect, useLayoutEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { ViewMode } from "../types";
+import { spreadStride } from "../utils/spread";
 
 interface ViewerProps {
   images: string[];
   currentPage: number;
   viewMode: ViewMode;
-  loadedUrls: Map<string, string>;
+  srcFor: (name: string) => string;
   imgLandscape: Map<string, boolean>;
-  failedPages?: Set<string>; // pages whose load_image failed (negative-cached, no retry)
+  failedPages: Set<string>;
   onOrientationLoad: (name: string, isLandscape: boolean) => void;
-  onVisiblePage?: (index: number) => void; // scroll mode: page index near viewport center
+  onPageError: (name: string) => void;
+  onVisiblePage?: (index: number) => void; // scroll mode: page index at viewport center
   error?: string | null;
 }
 
-export function Viewer({ images, currentPage, viewMode, loadedUrls, imgLandscape, failedPages, onOrientationLoad, onVisiblePage, error }: ViewerProps) {
+export function Viewer({
+  images,
+  currentPage,
+  viewMode,
+  srcFor,
+  imgLandscape,
+  failedPages,
+  onOrientationLoad,
+  onPageError,
+  onVisiblePage,
+  error,
+}: ViewerProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
-  const rafRef = useRef(0);
 
   // Reset scroll when the page list swaps (new zip), not when the sidebar
   // selection changes — selection updates before the load finishes, and
@@ -25,26 +37,65 @@ export function Viewer({ images, currentPage, viewMode, loadedUrls, imgLandscape
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
   }, [images]);
 
-  useEffect(() => () => cancelAnimationFrame(rafRef.current), []);
+  // Track the page at the viewport centre so switching scroll → single keeps
+  // the reading position. An IntersectionObserver whose root is collapsed to a
+  // line at the centre reports this in O(1); the old scroll handler walked
+  // every page element on each frame and read offsetTop, forcing layout.
+  useEffect(() => {
+    if (viewMode !== "scroll" || !onVisiblePage) return;
+    const root = scrollRef.current;
+    if (!root) return;
 
-  // Report which page sits at the viewport center so the loader can keep the
-  // window around the reading position (rAF-throttled)
-  const handleScroll = () => {
-    cancelAnimationFrame(rafRef.current);
-    rafRef.current = requestAnimationFrame(() => {
-      const el = scrollRef.current;
-      if (!el || !onVisiblePage) return;
-      const mid = el.scrollTop + el.clientHeight / 2;
-      const children = el.children;
-      for (let i = 0; i < children.length; i++) {
-        const c = children[i] as HTMLElement;
-        if (c.offsetTop + c.offsetHeight >= mid) {
-          onVisiblePage(i);
-          return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          const page = Number((entry.target as HTMLElement).dataset.page);
+          if (!Number.isNaN(page)) onVisiblePage(page);
+          break;
         }
-      }
-    });
-  };
+      },
+      { root, rootMargin: "-50% 0px -50% 0px", threshold: 0 },
+    );
+    root.querySelectorAll<HTMLElement>(".scroll-page").forEach((el) => io.observe(el));
+    return () => io.disconnect();
+  }, [viewMode, images, onVisiblePage]);
+
+  // Scrolling updates currentPage on every page boundary, but the scroll list
+  // doesn't depend on it — memoising keeps React from reconciling all N page
+  // nodes on each tick. Same element references = children skipped entirely.
+  const scrollPages = useMemo(
+    () =>
+      images.map((name, idx) => {
+        const src = srcFor(name);
+        return (
+          // Keyed by src, not name: "001.jpg" exists in every archive, and
+          // reusing the previous zip's node would carry over its resolved
+          // height while the new page loads.
+          <div key={src} className="scroll-page" data-page={idx}>
+            {failedPages.has(name) ? (
+              <div className="page-placeholder page-failed">Failed to load page {idx + 1}</div>
+            ) : (
+              <img
+                src={src}
+                alt={`Page ${idx + 1}`}
+                className="scroll-img"
+                loading="lazy"
+                decoding="async"
+                // .scroll-img reserves a 2:3 box so pages below don't jump when
+                // a lazy image arrives. Cleared imperatively rather than via
+                // state — a re-render per load would touch all N page nodes.
+                onLoad={(e) => {
+                  e.currentTarget.style.aspectRatio = "auto";
+                }}
+                onError={() => onPageError(name)}
+              />
+            )}
+          </div>
+        );
+      }),
+    [images, srcFor, failedPages, onPageError],
+  );
 
   if (error) {
     return (
@@ -65,49 +116,32 @@ export function Viewer({ images, currentPage, viewMode, loadedUrls, imgLandscape
 
   if (viewMode === "scroll") {
     return (
-      <div className="viewer viewer-scroll" ref={scrollRef} onScroll={handleScroll}>
-        {images.map((name, idx) => {
-          const url = loadedUrls.get(name);
-          return (
-            <div key={name} className="scroll-page">
-              {url ? (
-                <img
-                  src={url}
-                  alt={`Page ${idx + 1}`}
-                  className="scroll-img"
-                  loading="lazy"
-                  decoding="async"
-                />
-              ) : failedPages?.has(name) ? (
-                <div className="page-placeholder page-failed">Failed to load page {idx + 1}</div>
-              ) : (
-                <div className="page-placeholder">Loading {idx + 1}…</div>
-              )}
-            </div>
-          );
-        })}
+      <div className="viewer viewer-scroll" ref={scrollRef}>
+        {scrollPages}
       </div>
     );
   }
 
-  // single / double — pre-render adjacent spreads to avoid decode flicker on navigation
-  const stride = viewMode === "double" ? 2 : 1;
+  // single / double — pre-render adjacent spreads so navigation doesn't wait on
+  // a fetch+decode. Hidden spreads still load: the webview fetches them as soon
+  // as the <img> is in the DOM.
+  const doubleMode = viewMode === "double";
   const PRELOAD = 6;
   const spreads: number[] = [];
 
-  // Backward: include every page in range so landscape-caused odd-index pages are always covered.
-  // effectiveStride depends on each page's landscape status, so stride-2 skipping misses reachable pages.
-  const maxBack = stride * PRELOAD;
+  // Backward: include every page in range so landscape-caused odd-index pages
+  // are always covered. Stride depends on each page's orientation, so stride-2
+  // skipping backwards would miss reachable pages.
+  const maxBack = (doubleMode ? 2 : 1) * PRELOAD;
   for (let p = Math.max(0, currentPage - maxBack); p < currentPage; p++) spreads.push(p);
 
   spreads.push(currentPage);
 
-  // Forward: landscape-aware stride to mirror actual goNext navigation
+  // Forward: orientation-aware stride, mirroring actual goNext navigation
   {
     let fp = currentPage;
     for (let i = 0; i < PRELOAD; i++) {
-      const isLandscape = viewMode === "double" && imgLandscape.get(images[fp]) === true;
-      fp += isLandscape ? 1 : stride;
+      fp += spreadStride(images, imgLandscape, fp, doubleMode);
       if (fp >= images.length) break;
       spreads.push(fp);
     }
@@ -117,14 +151,11 @@ export function Viewer({ images, currentPage, viewMode, loadedUrls, imgLandscape
     <div className="viewer viewer-paged">
       {spreads.map((spreadPage) => {
         const isActive = spreadPage === currentPage;
-
-        // In double mode, collapse to single if the lead page is landscape
-        const leadName = images[spreadPage];
-        const leadIsLandscape = viewMode === "double" && imgLandscape.get(leadName) === true;
-        const names =
-          viewMode === "double" && !leadIsLandscape
-            ? [images[spreadPage + 1], images[spreadPage]].filter(Boolean)
-            : [images[spreadPage]].filter(Boolean);
+        // Pair only when neither half is landscape — same rule App navigates by
+        const paired = spreadStride(images, imgLandscape, spreadPage, doubleMode) === 2;
+        const names = (
+          paired ? [images[spreadPage + 1], images[spreadPage]] : [images[spreadPage]]
+        ).filter(Boolean);
 
         return (
           <div
@@ -133,23 +164,41 @@ export function Viewer({ images, currentPage, viewMode, loadedUrls, imgLandscape
             style={isActive ? undefined : { opacity: 0, pointerEvents: "none" }}
           >
             {names.map((name) => {
-              const url = loadedUrls.get(name);
+              const src = srcFor(name);
+              // imgLandscape gains an entry exactly when the image finishes
+              // loading, so it doubles as the "loaded" flag. Cheap here — a
+              // paged view only ever holds ~13 images.
+              const loaded = imgLandscape.has(name);
               return (
-                <div key={name} className="page-slot">
-                  {url ? (
-                    <img
-                      src={url}
-                      alt={name}
-                      className="page-img"
-                      onLoad={(e) => {
-                        const el = e.currentTarget;
-                        onOrientationLoad(name, el.naturalWidth > el.naturalHeight);
-                      }}
-                    />
-                  ) : failedPages?.has(name) ? (
+                <div key={src} className="page-slot">
+                  {failedPages.has(name) ? (
                     <div className="page-placeholder page-failed">Failed to load</div>
                   ) : (
-                    <div className="page-placeholder">Loading…</div>
+                    <>
+                      {/* The placeholder sits beside the image, never in place
+                          of it: a display:none <img> is never decoded, so
+                          hiding the hidden-but-preloading spreads would defeat
+                          the whole preload and flash on every page turn.
+                          An unloaded <img> is 0×0, so it costs no layout.
+                          No `decoding="async"` either — the point of preloading
+                          is that revealing a spread needs no decode at all. */}
+                      {!loaded && <div className="page-placeholder">Loading…</div>}
+                      <img
+                        src={src}
+                        alt={name}
+                        className="page-img"
+                        // Backward spreads come first in DOM order, so after a
+                        // jump the page being read would queue behind up to 12
+                        // preloads. Order can't be changed (it keeps React from
+                        // moving nodes on every turn) — priority can.
+                        fetchPriority={isActive ? "high" : "auto"}
+                        onLoad={(e) => {
+                          const el = e.currentTarget;
+                          onOrientationLoad(name, el.naturalWidth > el.naturalHeight);
+                        }}
+                        onError={() => onPageError(name)}
+                      />
+                    </>
                   )}
                 </div>
               );

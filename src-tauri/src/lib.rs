@@ -2,20 +2,37 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
+
 use serde::{Deserialize, Serialize};
+use tauri::http::{header, Response as HttpResponse, StatusCode};
 use tauri::ipc::Response;
 use tokio::sync::Semaphore;
 use walkdir::WalkDir;
+
+// A panicking reader would otherwise poison the lock and turn every later
+// page request into a panic. The data behind these mutexes is a plain cache —
+// recovering the inner value is always safe.
+fn lock_ok<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 static THUMB_SEM: OnceLock<Semaphore> = OnceLock::new();
 fn thumb_sem() -> &'static Semaphore {
     THUMB_SEM.get_or_init(|| Semaphore::new(4))
 }
 
+// The webview fires page requests as fast as it renders <img> tags; cap how
+// many zip reads run at once so a scroll burst can't spawn dozens of them.
+static PAGE_SEM: OnceLock<Semaphore> = OnceLock::new();
+fn page_sem() -> &'static Semaphore {
+    PAGE_SEM.get_or_init(|| Semaphore::new(6))
+}
+
 // Pool of parsed archive handles for the current zip — avoids reopening the file
-// and reparsing the central directory on every load_image call. Up to 4 handles
-// (matching frontend load concurrency) so parallel reads stay parallel.
+// and reparsing the central directory on every page request. Up to 4 handles so
+// parallel reads stay parallel.
 type PooledArchive = (String, zip::ZipArchive<File>);
 static ARCHIVE_POOL: OnceLock<Mutex<Vec<PooledArchive>>> = OnceLock::new();
 fn archive_pool() -> &'static Mutex<Vec<PooledArchive>> {
@@ -23,15 +40,25 @@ fn archive_pool() -> &'static Mutex<Vec<PooledArchive>> {
 }
 
 // Path of the zip currently being read; set by list_zip_images. A stale
-// load_image finishing after a zip switch must not flush the new zip's pool.
+// page request finishing after a zip switch must not flush the new zip's pool.
 static CURRENT_ZIP: OnceLock<Mutex<String>> = OnceLock::new();
 fn current_zip() -> &'static Mutex<String> {
     CURRENT_ZIP.get_or_init(|| Mutex::new(String::new()))
 }
 
+// When the last page read finished. Idle pooled handles keep the zip file
+// locked on Windows (blocks delete/rename in Explorer), and with the webview
+// driving requests there is no frontend "queue drained" moment to hook — so a
+// background thread drops them once reads go quiet.
+static LAST_READ: OnceLock<Mutex<Instant>> = OnceLock::new();
+fn last_read() -> &'static Mutex<Instant> {
+    LAST_READ.get_or_init(|| Mutex::new(Instant::now()))
+}
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_millis(1500);
+
 fn take_archive(zip_path: &str) -> Result<zip::ZipArchive<File>, String> {
     {
-        let mut pool = archive_pool().lock().unwrap();
+        let mut pool = lock_ok(archive_pool());
         if let Some(pos) = pool.iter().position(|(p, _)| p == zip_path) {
             return Ok(pool.remove(pos).1);
         }
@@ -41,14 +68,28 @@ fn take_archive(zip_path: &str) -> Result<zip::ZipArchive<File>, String> {
 }
 
 fn return_archive(zip_path: &str, archive: zip::ZipArchive<File>) {
-    if *current_zip().lock().unwrap() != zip_path {
+    *lock_ok(last_read()) = Instant::now();
+    if *lock_ok(current_zip()) != zip_path {
         return; // stale handle from a previous zip — drop it
     }
-    let mut pool = archive_pool().lock().unwrap();
+    let mut pool = lock_ok(archive_pool());
     pool.retain(|(p, _)| p == zip_path); // cache only the current zip
     if pool.len() < 4 {
         pool.push((zip_path.to_string(), archive));
     }
+}
+
+fn spawn_pool_reaper() {
+    std::thread::spawn(|| loop {
+        std::thread::sleep(POOL_IDLE_TIMEOUT);
+        if lock_ok(last_read()).elapsed() < POOL_IDLE_TIMEOUT {
+            continue;
+        }
+        let mut pool = lock_ok(archive_pool());
+        if !pool.is_empty() {
+            pool.clear(); // releases the Windows file lock
+        }
+    });
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -62,6 +103,14 @@ pub struct FolderEntry {
     pub name: String,
     pub path: String,
     pub zip_files: Vec<ZipFileEntry>,
+}
+
+#[derive(Serialize)]
+pub struct ZipListing {
+    pub names: Vec<String>,
+    // Zip mtime, used by the frontend as a cache-busting version in page URLs
+    // so responses can be cached forever yet never go stale.
+    pub mtime: u64,
 }
 
 fn natural_sort_cmp(a: &str, b: &str) -> std::cmp::Ordering {
@@ -126,6 +175,53 @@ fn is_image_file(name: &str) -> bool {
     )
 }
 
+// Archives zipped on macOS carry an `__MACOSX/` shadow tree whose `._name`
+// AppleDouble entries keep the original extension — they pass the extension
+// check, so every page would show up twice and `._001.jpg` (which sorts first)
+// would be picked as the cover and fail to decode.
+fn is_junk_entry(name: &str) -> bool {
+    if name.ends_with('/') || name.ends_with('\\') {
+        return true; // directory entry
+    }
+    if name.split(['/', '\\']).any(|s| s == "__MACOSX") {
+        return true;
+    }
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    base.starts_with("._")
+        || base.eq_ignore_ascii_case("thumbs.db")
+        || base.eq_ignore_ascii_case(".ds_store")
+}
+
+fn is_page_entry(name: &str) -> bool {
+    is_image_file(name) && !is_junk_entry(name)
+}
+
+fn sorted_page_names(archive: &zip::ZipArchive<File>) -> Vec<String> {
+    let mut names: Vec<String> = archive
+        .file_names()
+        .filter(|n| is_page_entry(n))
+        .map(|s| s.to_string())
+        .collect();
+    names.sort_by(|a, b| natural_sort_cmp(a, b));
+    names
+}
+
+fn read_entry(archive: &mut zip::ZipArchive<File>, name: &str) -> Result<Vec<u8>, String> {
+    let mut entry = archive.by_name(name).map_err(|e| e.to_string())?;
+    let mut buf = Vec::with_capacity(alloc_hint(entry.size()));
+    entry.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    Ok(buf)
+}
+
+fn mtime_secs(path: &str) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[tauri::command]
 async fn scan_directory(path: String) -> Result<Vec<FolderEntry>, String> {
     tauri::async_runtime::spawn_blocking(move || scan_directory_blocking(&path))
@@ -188,22 +284,17 @@ fn scan_directory_blocking(path: &str) -> Result<Vec<FolderEntry>, String> {
 }
 
 #[tauri::command]
-async fn list_zip_images(zip_path: String) -> Result<Vec<String>, String> {
+async fn list_zip_images(zip_path: String) -> Result<ZipListing, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        *current_zip().lock().unwrap() = zip_path.clone();
+        *lock_ok(current_zip()) = zip_path.clone();
         // Drop the previous zip's pooled handles now — if opening the new zip
-        // fails below, release_zip_handles(old) becomes a no-op (CURRENT_ZIP
-        // moved on) and the old file would stay locked on Windows
-        archive_pool().lock().unwrap().retain(|(p, _)| p == &zip_path);
+        // fails below, the reaper would leave the old file locked for another
+        // idle interval while CURRENT_ZIP has already moved on
+        lock_ok(archive_pool()).retain(|(p, _)| p == &zip_path);
         let archive = take_archive(&zip_path)?;
-        let mut names: Vec<String> = archive
-            .file_names()
-            .filter(|n| is_image_file(n))
-            .map(|s| s.to_string())
-            .collect();
-        return_archive(&zip_path, archive); // prewarm pool for the load_image calls that follow
-        names.sort_by(|a, b| natural_sort_cmp(a, b));
-        Ok(names)
+        let names = sorted_page_names(&archive);
+        return_archive(&zip_path, archive); // prewarm pool for the page requests that follow
+        Ok(ZipListing { names, mtime: mtime_secs(&zip_path) })
     })
     .await
     .map_err(|e| e.to_string())?
@@ -212,7 +303,7 @@ async fn list_zip_images(zip_path: String) -> Result<Vec<String>, String> {
 // Thumbs are keyed by zip path+mtime, so a changed zip leaves its old thumb
 // orphaned forever. Age-based sweep on startup; evicted thumbs regenerate on view.
 fn clean_thumb_cache(thumbs_dir: &Path) {
-    const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
+    const MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
     let Some(cutoff) = std::time::SystemTime::now().checked_sub(MAX_AGE) else { return };
     let Ok(entries) = std::fs::read_dir(thumbs_dir) else { return };
     for entry in entries.flatten() {
@@ -238,6 +329,21 @@ fn thumb_cache_key(path: &str, mtime_secs: u64) -> String {
     format!("{:016x}", h)
 }
 
+// Guards the full-size decode that precedes downscaling: a 4000x6000 source is
+// ~96 MB as RGBA, and four of those in parallel would spike past 400 MB.
+fn decode_limited(raw: &[u8]) -> Result<image::DynamicImage, String> {
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    limits.max_image_width = Some(20_000);
+    limits.max_image_height = Some(20_000);
+
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(raw))
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?;
+    reader.limits(limits);
+    reader.decode().map_err(|e| e.to_string())
+}
+
 // Returns a resized JPEG thumbnail (≤150×200). Cached to disk by path+mtime hash.
 #[tauri::command]
 async fn load_cover_thumb(app: tauri::AppHandle, zip_path: String) -> Result<Response, String> {
@@ -250,13 +356,7 @@ async fn load_cover_thumb(app: tauri::AppHandle, zip_path: String) -> Result<Res
         let zip_path = zip_path.clone();
         let thumbs_dir = thumbs_dir.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            let mtime = std::fs::metadata(&zip_path)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let key = thumb_cache_key(&zip_path, mtime);
+            let key = thumb_cache_key(&zip_path, mtime_secs(&zip_path));
             let cache_file = thumbs_dir.join(format!("{}.jpg", key));
             let cached = std::fs::read(&cache_file).ok();
             if let Some(bytes) = &cached {
@@ -267,7 +367,7 @@ async fn load_cover_thumb(app: tauri::AppHandle, zip_path: String) -> Result<Res
                     .and_then(|m| m.modified())
                     .ok()
                     .and_then(|t| t.elapsed().ok())
-                    .map(|age| age > std::time::Duration::from_secs(7 * 24 * 3600))
+                    .map(|age| age > Duration::from_secs(7 * 24 * 3600))
                     .unwrap_or(false);
                 if is_stale {
                     let _ = std::fs::write(&cache_file, bytes);
@@ -290,20 +390,17 @@ async fn load_cover_thumb(app: tauri::AppHandle, zip_path: String) -> Result<Res
         let file = File::open(&zip_path).map_err(|e| format!("{}: {}", zip_path, e))?;
         let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
 
-        let mut names: Vec<String> = archive
-            .file_names()
-            .filter(|n| is_image_file(n))
-            .map(|s| s.to_string())
-            .collect();
-        names.sort_by(|a, b| natural_sort_cmp(a, b));
+        let first = sorted_page_names(&archive)
+            .into_iter()
+            .next()
+            .ok_or("no images in zip")?;
+        let raw = read_entry(&mut archive, &first)?;
 
-        let first = names.into_iter().next().ok_or("no images in zip")?;
-        let mut entry = archive.by_name(&first).map_err(|e| e.to_string())?;
-        let mut raw = Vec::with_capacity(alloc_hint(entry.size()));
-        entry.read_to_end(&mut raw).map_err(|e| e.to_string())?;
-
-        let img = image::load_from_memory(&raw).map_err(|e| e.to_string())?;
-        let thumb = img.thumbnail(150, 200);
+        let thumb = {
+            let img = decode_limited(&raw)?;
+            img.thumbnail(150, 200) // full-size decode dropped right after
+        };
+        drop(raw);
 
         let mut out: Vec<u8> = Vec::new();
         {
@@ -322,33 +419,88 @@ async fn load_cover_thumb(app: tauri::AppHandle, zip_path: String) -> Result<Res
     Ok(Response::new(bytes))
 }
 
-#[tauri::command]
-async fn load_image(zip_path: String, name: String) -> Result<Response, String> {
-    let bytes = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
-        let mut archive = take_archive(&zip_path)?;
-        let bytes = {
-            let mut entry = archive.by_name(&name).map_err(|e| e.to_string())?;
-            let mut bytes = Vec::with_capacity(alloc_hint(entry.size()));
-            entry.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-            bytes
-        };
-        return_archive(&zip_path, archive);
-        Ok(bytes)
-    })
-    .await
-    .map_err(|e| e.to_string())??;
-    Ok(Response::new(bytes))
+// ---------------------------------------------------------------------------
+// manga:// page protocol
+//
+// Pages go straight to <img src> instead of being shipped over IPC as
+// ArrayBuffers. The webview then owns fetching, decode scheduling and memory
+// eviction — which is what makes `loading="lazy"` viable in scroll mode and
+// removes the need for a hand-rolled load window on the frontend.
+// ---------------------------------------------------------------------------
+
+fn mime_for(name: &str) -> &'static str {
+    match Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        Some("avif") => "image/avif",
+        Some("bmp") => "image/bmp",
+        _ => "image/jpeg",
+    }
 }
 
-// Called by the frontend whenever its load queue drains. Idle pooled handles
-// lock the zip file on Windows (blocks delete/rename in Explorer). CURRENT_ZIP
-// stays set so the pool re-warms on the next load burst for the same zip.
-#[tauri::command]
-fn release_zip_handles(zip_path: String) {
-    if *current_zip().lock().unwrap() != zip_path {
-        return; // another zip is already loading; leave its pool alone
+fn query_param(query: &str, key: &str) -> Option<String> {
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == key {
+                return percent_encoding::percent_decode_str(v)
+                    .decode_utf8()
+                    .ok()
+                    .map(|s| s.into_owned());
+            }
+        }
     }
-    archive_pool().lock().unwrap().clear();
+    None
+}
+
+fn error_response(status: StatusCode, msg: &str) -> HttpResponse<Vec<u8>> {
+    HttpResponse::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/plain")
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .body(msg.as_bytes().to_vec())
+        .unwrap_or_else(|_| HttpResponse::new(Vec::new()))
+}
+
+fn serve_page(query: &str) -> HttpResponse<Vec<u8>> {
+    let (Some(zip_path), Some(name)) = (query_param(query, "zip"), query_param(query, "name"))
+    else {
+        return error_response(StatusCode::BAD_REQUEST, "missing zip/name");
+    };
+    // Only entries the listing itself would have exposed are readable here
+    if !is_page_entry(&name) {
+        return error_response(StatusCode::FORBIDDEN, "not a page entry");
+    }
+
+    let mut archive = match take_archive(&zip_path) {
+        Ok(a) => a,
+        Err(e) => return error_response(StatusCode::NOT_FOUND, &e),
+    };
+    // Read, then hand the archive back before branching — an in-scope ZipFile
+    // keeps the archive borrowed and blocks the pool return
+    let read = read_entry(&mut archive, &name);
+    return_archive(&zip_path, archive);
+    let bytes = match read {
+        Ok(b) => b,
+        Err(e) => return error_response(StatusCode::NOT_FOUND, &e),
+    };
+
+    HttpResponse::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime_for(&name))
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        // The URL carries the zip's mtime, so a given URL always maps to the
+        // same bytes — editing the zip mints new URLs instead of going stale.
+        .header(header::CACHE_CONTROL, "max-age=31536000, immutable")
+        .body(bytes)
+        .unwrap_or_else(|_| {
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
+        })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -358,14 +510,135 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_window_state::Builder::new().build())
+        .register_asynchronous_uri_scheme_protocol("manga", |_ctx, request, responder| {
+            let query = request.uri().query().unwrap_or("").to_string();
+            tauri::async_runtime::spawn(async move {
+                let Ok(_permit) = page_sem().acquire().await else {
+                    responder.respond(error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "shutting down",
+                    ));
+                    return;
+                };
+                let resp = tauri::async_runtime::spawn_blocking(move || serve_page(&query))
+                    .await
+                    .unwrap_or_else(|e| {
+                        error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+                    });
+                responder.respond(resp);
+            });
+        })
         .setup(|app| {
             use tauri::Manager;
             if let Ok(cache_dir) = app.path().app_cache_dir() {
                 std::thread::spawn(move || clean_thumb_cache(&cache_dir.join("thumbs")));
             }
+            spawn_pool_reaper();
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![scan_directory, list_zip_images, load_image, load_cover_thumb, release_zip_handles])
+        .invoke_handler(tauri::generate_handler![
+            scan_directory,
+            list_zip_images,
+            load_cover_thumb
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn junk_entries_are_rejected() {
+        assert!(is_junk_entry("__MACOSX/._001.jpg"));
+        assert!(is_junk_entry("book/__MACOSX/001.jpg"));
+        assert!(is_junk_entry("._001.jpg"));
+        assert!(is_junk_entry("book/Thumbs.db"));
+        assert!(is_junk_entry("book/"));
+        assert!(!is_junk_entry("book/001.jpg"));
+        assert!(!is_junk_entry("001.jpg"));
+    }
+
+    #[test]
+    fn page_entries_need_an_image_extension() {
+        assert!(is_page_entry("book/001.JPG"));
+        assert!(!is_page_entry("book/info.txt"));
+        assert!(!is_page_entry("__MACOSX/._001.jpg"));
+    }
+
+    #[test]
+    fn natural_sort_is_numeric_aware() {
+        let mut v = vec!["10.jpg", "9.jpg", "1.jpg", "002.jpg"];
+        v.sort_by(|a, b| natural_sort_cmp(a, b));
+        assert_eq!(v, vec!["1.jpg", "002.jpg", "9.jpg", "10.jpg"]);
+    }
+
+    // Builds a zip holding one real page plus the macOS shadow entries that
+    // used to slip through the extension check.
+    fn write_fixture_zip() -> std::path::PathBuf {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!(
+            "manga-reader-test-{}.zip",
+            std::process::id()
+        ));
+        let file = File::create(&path).unwrap();
+        let mut w = zip::ZipWriter::new(file);
+        let opts: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        w.start_file("book/002.png", opts).unwrap();
+        w.write_all(b"second").unwrap();
+        w.start_file("book/001.jpg", opts).unwrap();
+        w.write_all(b"first").unwrap();
+        w.start_file("__MACOSX/book/._001.jpg", opts).unwrap();
+        w.write_all(b"junk").unwrap();
+        w.finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn listing_and_protocol_round_trip() {
+        let zip_path = write_fixture_zip();
+        let zip_str = zip_path.to_string_lossy().to_string();
+
+        let archive = take_archive(&zip_str).unwrap();
+        let names = sorted_page_names(&archive);
+        drop(archive);
+        assert_eq!(names, vec!["book/001.jpg", "book/002.png"]);
+
+        let enc = |s: &str| {
+            percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
+        };
+        let ok = serve_page(&format!("zip={}&name={}", enc(&zip_str), enc(&names[0])));
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(ok.headers()[header::CONTENT_TYPE], "image/jpeg");
+        assert_eq!(ok.body(), b"first");
+
+        let png = serve_page(&format!("zip={}&name={}", enc(&zip_str), enc(&names[1])));
+        assert_eq!(png.headers()[header::CONTENT_TYPE], "image/png");
+
+        // Junk entries are unreachable even when asked for by name
+        let junk = serve_page(&format!(
+            "zip={}&name={}",
+            enc(&zip_str),
+            enc("__MACOSX/book/._001.jpg")
+        ));
+        assert_eq!(junk.status(), StatusCode::FORBIDDEN);
+
+        let missing = serve_page(&format!("zip={}&name=nope.jpg", enc(&zip_str)));
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        assert_eq!(serve_page("").status(), StatusCode::BAD_REQUEST);
+
+        lock_ok(archive_pool()).clear();
+        let _ = std::fs::remove_file(&zip_path);
+    }
+
+    #[test]
+    fn query_params_are_percent_decoded() {
+        let q = "zip=C%3A%5Cbooks%5Ca%20b.zip&name=001.jpg";
+        assert_eq!(query_param(q, "zip").as_deref(), Some(r"C:\books\a b.zip"));
+        assert_eq!(query_param(q, "name").as_deref(), Some("001.jpg"));
+        assert_eq!(query_param(q, "missing"), None);
+    }
 }
