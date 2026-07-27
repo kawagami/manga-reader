@@ -141,13 +141,14 @@ button:disabled {
 }
 
 /* ── Sidebar ── */
+/* The list inside owns the scrolling (react-window), so the shell must not
+   scroll too — a second scrollbar would double-count the virtual height. */
 .sidebar {
   width: 220px;
   flex-shrink: 0;
   background: var(--bg-sidebar);
   border-right: 1px solid var(--border);
-  overflow-y: auto;
-  overflow-x: hidden;
+  overflow: hidden;
 }
 
 .sidebar-empty {
@@ -160,11 +161,15 @@ button:disabled {
   text-align: center;
 }
 
+/* Heights are pinned here, not derived from content: react-window has to know
+   a row's height before rendering it. ROW_H_FOLDER / ROW_H_ZIP in Sidebar.tsx
+   must match (31px / 27px, borders included). */
 .folder-header {
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: 7px 8px;
+  height: 100%;
+  padding: 0 8px;
   cursor: pointer;
   border-bottom: 1px solid var(--border);
   user-select: none;
@@ -195,12 +200,13 @@ button:disabled {
   flex-shrink: 0;
 }
 
-.folder-files {
-  background: var(--bg);
-}
-
+/* Block + line-height rather than flex: ellipsis needs a block formatting
+   context, and the text is a direct child. */
 .zip-item {
-  padding: 5px 8px 5px 22px;
+  height: 100%;
+  padding: 0 8px 0 22px;
+  line-height: 26px;
+  background: var(--bg);
   cursor: pointer;
   overflow: hidden;
   text-overflow: ellipsis;
