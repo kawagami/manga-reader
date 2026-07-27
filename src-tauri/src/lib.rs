@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -44,6 +44,33 @@ fn archive_pool() -> &'static Mutex<Vec<PooledArchive>> {
 static CURRENT_ZIP: OnceLock<Mutex<String>> = OnceLock::new();
 fn current_zip() -> &'static Mutex<String> {
     CURRENT_ZIP.get_or_init(|| Mutex::new(String::new()))
+}
+
+// Zips the user has actually opened, most recent first. `serve_page` gates on
+// this rather than on CURRENT_ZIP: the frontend keeps the *previous* zip on
+// screen until the new listing and first-page decode land, so its <img> tags
+// legitimately request the old zip after CURRENT_ZIP has already moved on.
+// Gallery → double mode remounts the whole paged view during that window, so a
+// single-value gate 403s every page that is currently being read.
+static OPENED_ZIPS: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+const OPENED_ZIPS_MAX: usize = 4;
+fn opened_zips() -> &'static Mutex<VecDeque<String>> {
+    OPENED_ZIPS.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn remember_opened(zip_path: &str) {
+    let mut q = lock_ok(opened_zips());
+    if let Some(pos) = q.iter().position(|p| p == zip_path) {
+        q.remove(pos);
+    }
+    q.push_front(zip_path.to_string());
+    while q.len() > OPENED_ZIPS_MAX {
+        q.pop_back();
+    }
+}
+
+fn is_opened(zip_path: &str) -> bool {
+    lock_ok(opened_zips()).iter().any(|p| p == zip_path)
 }
 
 // When the last page read finished. Idle pooled handles keep the zip file
@@ -161,6 +188,11 @@ fn alloc_hint(claimed: u64) -> usize {
     claimed.min(64 * 1024 * 1024) as usize
 }
 
+// Hard ceiling on a decompressed entry. `alloc_hint` only bounds the initial
+// allocation — the decompressed stream itself is unbounded, so a 1 KB entry can
+// inflate to gigabytes and OOM the process. No real manga page comes close.
+const MAX_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
+
 fn is_image_file(name: &str) -> bool {
     matches!(
         Path::new(name)
@@ -207,9 +239,15 @@ fn sorted_page_names(archive: &zip::ZipArchive<File>) -> Vec<String> {
 }
 
 fn read_entry(archive: &mut zip::ZipArchive<File>, name: &str) -> Result<Vec<u8>, String> {
-    let mut entry = archive.by_name(name).map_err(|e| e.to_string())?;
+    let entry = archive.by_name(name).map_err(|e| e.to_string())?;
     let mut buf = Vec::with_capacity(alloc_hint(entry.size()));
-    entry.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    // Read one byte past the ceiling so an oversized entry is detected rather
+    // than silently truncated into a corrupt image.
+    let mut limited = entry.take(MAX_ENTRY_BYTES + 1);
+    limited.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    if buf.len() as u64 > MAX_ENTRY_BYTES {
+        return Err(format!("entry too large: {}", name));
+    }
     Ok(buf)
 }
 
@@ -287,6 +325,7 @@ fn scan_directory_blocking(path: &str) -> Result<Vec<FolderEntry>, String> {
 async fn list_zip_images(zip_path: String) -> Result<ZipListing, String> {
     tauri::async_runtime::spawn_blocking(move || {
         *lock_ok(current_zip()) = zip_path.clone();
+        remember_opened(&zip_path);
         // Drop the previous zip's pooled handles now — if opening the new zip
         // fails below, the reaper would leave the old file locked for another
         // idle interval while CURRENT_ZIP has already moved on
@@ -476,6 +515,12 @@ fn serve_page(query: &str) -> HttpResponse<Vec<u8>> {
     if !is_page_entry(&name) {
         return error_response(StatusCode::FORBIDDEN, "not a page entry");
     }
+    // ...and only out of a zip the user actually opened. Without this the
+    // scheme is a read primitive for any zip on disk: the webview (or anything
+    // that ends up running in it) could name an arbitrary path here.
+    if !is_opened(&zip_path) {
+        return error_response(StatusCode::FORBIDDEN, "zip not opened");
+    }
 
     let mut archive = match take_archive(&zip_path) {
         Ok(a) => a,
@@ -600,6 +645,9 @@ mod tests {
     fn listing_and_protocol_round_trip() {
         let zip_path = write_fixture_zip();
         let zip_str = zip_path.to_string_lossy().to_string();
+        // list_zip_images does both of these in production
+        *lock_ok(current_zip()) = zip_str.clone();
+        remember_opened(&zip_str);
 
         let archive = take_archive(&zip_str).unwrap();
         let names = sorted_page_names(&archive);
@@ -627,6 +675,29 @@ mod tests {
 
         let missing = serve_page(&format!("zip={}&name=nope.jpg", enc(&zip_str)));
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        // A zip the user never opened is off limits, however well-formed the
+        // request looks
+        let other = serve_page(&format!(
+            "zip={}&name={}",
+            enc(r"C:\somewhere\else.zip"),
+            enc("001.jpg")
+        ));
+        assert_eq!(other.status(), StatusCode::FORBIDDEN);
+
+        // A previously opened zip stays readable after CURRENT_ZIP moves on —
+        // the frontend keeps its pages on screen through the swap window
+        *lock_ok(current_zip()) = String::from(r"C:\some\other.zip");
+        remember_opened(r"C:\some\other.zip");
+        let prev = serve_page(&format!("zip={}&name={}", enc(&zip_str), enc(&names[0])));
+        assert_eq!(prev.status(), StatusCode::OK);
+
+        // ...but only for OPENED_ZIPS_MAX zips back
+        for i in 0..OPENED_ZIPS_MAX {
+            remember_opened(&format!(r"C:\some\filler{}.zip", i));
+        }
+        let evicted = serve_page(&format!("zip={}&name={}", enc(&zip_str), enc(&names[0])));
+        assert_eq!(evicted.status(), StatusCode::FORBIDDEN);
 
         assert_eq!(serve_page("").status(), StatusCode::BAD_REQUEST);
 
