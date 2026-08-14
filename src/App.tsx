@@ -6,7 +6,6 @@ import { restoreStateCurrent, StateFlags } from "@tauri-apps/plugin-window-state
 import { FolderEntry, ViewMode } from "./types";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useZipLoader } from "./hooks/useZipLoader";
-import { useCoverLoader } from "./hooks/useCoverLoader";
 import { saveSetting, loadSetting } from "./utils/store";
 import { spreadStride } from "./utils/spread";
 import { Sidebar } from "./components/Sidebar";
@@ -22,6 +21,9 @@ function App() {
   const [selectedZip, setSelectedZip] = useState<string | null>(null);
   const [currentPage, setCurrentPage] = useState(0);
   const [viewMode, setViewMode] = useState<ViewMode>("single");
+  // Lives here, not in Sidebar: gallery mode unmounts the sidebar, and folder
+  // state kept inside it was wiped every time the user looked at the covers.
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const [isDragOver, setIsDragOver] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const noticeTimerRef = useRef<number | undefined>(undefined);
@@ -34,7 +36,6 @@ function App() {
 
   useEffect(() => () => window.clearTimeout(noticeTimerRef.current), []);
 
-  const { covers, loadCover, resetCovers } = useCoverLoader();
   const {
     images,
     imgLandscape,
@@ -67,16 +68,13 @@ function App() {
     saveSetting(KEY_VIEW_MODE, mode).catch(console.error);
   }, []);
 
-  const scanDir = useCallback(
-    async (dir: string) => {
-      // Scan first — on failure (e.g. dropped path is not a directory) current state stays intact
-      const tree = await invoke<FolderEntry[]>("scan_directory", { path: dir });
-      resetCovers();
-      setFolderTree(tree);
-      await saveSetting(KEY_LAST_DIR, dir);
-    },
-    [resetCovers],
-  );
+  const scanDir = useCallback(async (dir: string) => {
+    // Scan first — on failure (e.g. dropped path is not a directory) current state stays intact
+    const tree = await invoke<FolderEntry[]>("scan_directory", { path: dir });
+    setFolderTree(tree);
+    setExpandedFolders(new Set()); // old root's folder paths are meaningless now
+    await saveSetting(KEY_LAST_DIR, dir);
+  }, []);
 
   const selectRoot = async () => {
     const dir = await open({ directory: true, multiple: false });
@@ -248,10 +246,8 @@ function App() {
         {viewMode === "gallery" ? (
           <Gallery
             folders={folderTree}
-            coverImages={covers}
             selectedZip={selectedZip}
             onSelectZip={openFromGallery}
-            onLoadCover={loadCover}
           />
         ) : (
           <>
@@ -259,6 +255,8 @@ function App() {
               folders={folderTree}
               selectedZip={selectedZip}
               onSelectZip={selectZip}
+              expanded={expandedFolders}
+              setExpanded={setExpandedFolders}
             />
             <Viewer
               images={images}

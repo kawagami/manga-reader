@@ -21,3 +21,12 @@ export function pageUrl(zipPath: string, name: string, version: number): string 
     `&name=${encodeURIComponent(name)}&v=${version}`
   );
 }
+
+// Gallery covers go through the same scheme, so an <img src> is the whole
+// mechanism: the webview caches and evicts them itself. This replaced a hook
+// that shipped covers over IPC as ArrayBuffers and hand-rolled a blob-URL LRU
+// with revoke bookkeeping, because blob URLs leak unless something frees them.
+// `version` is the zip mtime from scan_directory — same immutable-URL trick.
+export function thumbUrl(zipPath: string, version: number): string {
+  return `${protocolOrigin()}?zip=${encodeURIComponent(zipPath)}&thumb=1&v=${version}`;
+}

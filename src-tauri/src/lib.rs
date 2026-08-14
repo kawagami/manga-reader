@@ -1,13 +1,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::http::{header, Response as HttpResponse, StatusCode};
-use tauri::ipc::Response;
 use tokio::sync::Semaphore;
 use walkdir::WalkDir;
 
@@ -73,6 +72,55 @@ fn is_opened(zip_path: &str) -> bool {
     lock_ok(opened_zips()).iter().any(|p| p == zip_path)
 }
 
+// Roots the user has scanned. Gallery covers are requested for every zip in the
+// tree, not just opened ones, so thumbs can't gate on OPENED_ZIPS — they gate on
+// "somewhere under a directory the user pointed us at" instead. Without a gate
+// the scheme would render a thumbnail of the first image in *any* zip on disk.
+static SCAN_ROOTS: OnceLock<Mutex<VecDeque<PathBuf>>> = OnceLock::new();
+const SCAN_ROOTS_MAX: usize = 4;
+fn scan_roots() -> &'static Mutex<VecDeque<PathBuf>> {
+    SCAN_ROOTS.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn remember_scan_root(root: &Path) {
+    let mut q = lock_ok(scan_roots());
+    if let Some(pos) = q.iter().position(|p| p == root) {
+        q.remove(pos);
+    }
+    q.push_front(root.to_path_buf());
+    while q.len() > SCAN_ROOTS_MAX {
+        q.pop_back();
+    }
+}
+
+fn is_scanned_zip(zip_path: &str) -> bool {
+    let path = Path::new(zip_path);
+    let ext_ok = matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .as_deref(),
+        Some("zip") | Some("cbz")
+    );
+    // Path::starts_with compares whole components, so a "C:\books" root does
+    // not admit "C:\booksXXX\evil.zip"
+    ext_ok && lock_ok(scan_roots()).iter().any(|root| path.starts_with(root))
+}
+
+// AppCache/thumbs, resolved once in setup(). The protocol handler has no
+// AppHandle, and re-resolving it per request would stat the cache dir on every
+// gallery cell.
+static THUMBS_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+// Zips whose cover could not be produced (corrupt archive, no images, decoder
+// can't handle the format). A failure leaves nothing in the disk cache, so
+// without this every scroll past the card reopens the zip and reparses its
+// central directory. Cleared on rescan, which is the only thing that can fix it.
+static FAILED_THUMBS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+fn failed_thumbs() -> &'static Mutex<std::collections::HashSet<String>> {
+    FAILED_THUMBS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
 // When the last page read finished. Idle pooled handles keep the zip file
 // locked on Windows (blocks delete/rename in Explorer), and with the webview
 // driving requests there is no frontend "queue drained" moment to hook — so a
@@ -123,6 +171,9 @@ fn spawn_pool_reaper() {
 pub struct ZipFileEntry {
     pub name: String,
     pub path: String,
+    // Cache-busting version for the cover URL, same role `mtime` plays in
+    // ZipListing. Taken from walkdir's cached metadata, so it costs no extra stat.
+    pub mtime: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -301,6 +352,13 @@ fn scan_directory_blocking(path: &str) -> Result<Vec<FolderEntry>, String> {
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_string();
+        let mtime = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
         let folder = folder_map.entry(folder_path.clone()).or_insert_with(|| FolderEntry {
             name: folder_name,
@@ -310,6 +368,7 @@ fn scan_directory_blocking(path: &str) -> Result<Vec<FolderEntry>, String> {
         folder.zip_files.push(ZipFileEntry {
             name: zip_name,
             path: file_path.to_string_lossy().to_string(),
+            mtime,
         });
     }
 
@@ -318,6 +377,9 @@ fn scan_directory_blocking(path: &str) -> Result<Vec<FolderEntry>, String> {
         folder.zip_files.sort_by(|a, b| natural_sort_cmp(&a.name, &b.name));
     }
     folders.sort_by(|a, b| natural_sort_cmp(&a.name, &b.name).then_with(|| a.path.cmp(&b.path)));
+    // Only on success — a failed scan must not widen what the cover protocol serves
+    remember_scan_root(root);
+    lock_ok(failed_thumbs()).clear(); // give replaced/repaired zips another try
     Ok(folders)
 }
 
@@ -383,79 +445,61 @@ fn decode_limited(raw: &[u8]) -> Result<image::DynamicImage, String> {
     reader.decode().map_err(|e| e.to_string())
 }
 
-// Returns a resized JPEG thumbnail (≤150×200). Cached to disk by path+mtime hash.
-#[tauri::command]
-async fn load_cover_thumb(app: tauri::AppHandle, zip_path: String) -> Result<Response, String> {
-    use tauri::Manager;
-    let cache_dir = app.path().app_cache_dir().map_err(|e| e.to_string())?;
-    let thumbs_dir = cache_dir.join("thumbs");
+// Blocking half of the thumb cache lookup. Returns where the thumb belongs plus
+// its bytes if they are already there.
+fn read_cached_thumb(thumbs_dir: &Path, zip_path: &str) -> (PathBuf, Option<Vec<u8>>) {
+    let key = thumb_cache_key(zip_path, mtime_secs(zip_path));
+    let cache_file = thumbs_dir.join(format!("{}.jpg", key));
+    let cached = std::fs::read(&cache_file).ok();
+    if let Some(bytes) = &cached {
+        // Refresh mtime occasionally so frequently viewed thumbs survive the
+        // 30-day sweep (rewrite is cheap; only when >7 days old)
+        let is_stale = cache_file
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|age| age > Duration::from_secs(7 * 24 * 3600))
+            .unwrap_or(false);
+        if is_stale {
+            let _ = std::fs::write(&cache_file, bytes);
+        }
+    }
+    (cache_file, cached)
+}
 
-    // Cache check first — hits shouldn't queue behind slow decode jobs
-    let (cache_file, cached) = {
-        let zip_path = zip_path.clone();
-        let thumbs_dir = thumbs_dir.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            let key = thumb_cache_key(&zip_path, mtime_secs(&zip_path));
-            let cache_file = thumbs_dir.join(format!("{}.jpg", key));
-            let cached = std::fs::read(&cache_file).ok();
-            if let Some(bytes) = &cached {
-                // Refresh mtime occasionally so frequently viewed thumbs survive
-                // the 30-day sweep (rewrite is cheap; only when >7 days old)
-                let is_stale = cache_file
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.elapsed().ok())
-                    .map(|age| age > Duration::from_secs(7 * 24 * 3600))
-                    .unwrap_or(false);
-                if is_stale {
-                    let _ = std::fs::write(&cache_file, bytes);
-                }
-            }
-            (cache_file, cached)
-        })
-        .await
-        .map_err(|e| e.to_string())?
-    };
-    if let Some(bytes) = cached {
-        return Ok(Response::new(bytes));
+// Extracts the first page and downscales it to a ≤150×200 JPEG. Opens the zip
+// directly rather than through the archive pool: gallery zips are not the zip
+// being read, and pooling them would evict the current one's handles.
+fn generate_thumb(zip_path: &str, cache_file: &Path) -> Result<Vec<u8>, String> {
+    if let Some(dir) = cache_file.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
 
-    let _permit = thumb_sem().acquire().await.map_err(|e| e.to_string())?;
+    let file = File::open(zip_path).map_err(|e| format!("{}: {}", zip_path, e))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
 
-    let bytes = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
-        std::fs::create_dir_all(&thumbs_dir).map_err(|e| e.to_string())?;
+    let first = sorted_page_names(&archive)
+        .into_iter()
+        .next()
+        .ok_or("no images in zip")?;
+    let raw = read_entry(&mut archive, &first)?;
 
-        let file = File::open(&zip_path).map_err(|e| format!("{}: {}", zip_path, e))?;
-        let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+    let thumb = {
+        let img = decode_limited(&raw)?;
+        img.thumbnail(150, 200) // full-size decode dropped right after
+    };
+    drop(raw);
 
-        let first = sorted_page_names(&archive)
-            .into_iter()
-            .next()
-            .ok_or("no images in zip")?;
-        let raw = read_entry(&mut archive, &first)?;
+    let mut out: Vec<u8> = Vec::new();
+    {
+        let encoder =
+            image::codecs::jpeg::JpegEncoder::new_with_quality(std::io::Cursor::new(&mut out), 80);
+        thumb.write_with_encoder(encoder).map_err(|e| e.to_string())?;
+    }
 
-        let thumb = {
-            let img = decode_limited(&raw)?;
-            img.thumbnail(150, 200) // full-size decode dropped right after
-        };
-        drop(raw);
-
-        let mut out: Vec<u8> = Vec::new();
-        {
-            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
-                std::io::Cursor::new(&mut out), 80,
-            );
-            thumb.write_with_encoder(encoder).map_err(|e| e.to_string())?;
-        }
-
-        let _ = std::fs::write(&cache_file, &out);
-        Ok(out)
-    })
-    .await
-    .map_err(|e| e.to_string())??;
-
-    Ok(Response::new(bytes))
+    let _ = std::fs::write(cache_file, &out);
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -548,6 +592,65 @@ fn serve_page(query: &str) -> HttpResponse<Vec<u8>> {
         })
 }
 
+fn thumb_response(bytes: Vec<u8>) -> HttpResponse<Vec<u8>> {
+    HttpResponse::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/jpeg")
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        // `v` is the zip mtime (see thumbUrl), so a URL names one set of bytes
+        .header(header::CACHE_CONTROL, "max-age=31536000, immutable")
+        .body(bytes)
+        .unwrap_or_else(|_| {
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
+        })
+}
+
+// Gallery covers. Async rather than one spawn_blocking call because the cache
+// lookup deliberately sits *outside* THUMB_SEM: a gallery scroll is nearly all
+// hits, and making them queue behind four cold decodes stalls the whole grid.
+async fn serve_thumb(query: &str) -> HttpResponse<Vec<u8>> {
+    let Some(zip_path) = query_param(query, "zip") else {
+        return error_response(StatusCode::BAD_REQUEST, "missing zip");
+    };
+    if !is_scanned_zip(&zip_path) {
+        return error_response(StatusCode::FORBIDDEN, "zip not under a scanned root");
+    }
+    if lock_ok(failed_thumbs()).contains(&zip_path) {
+        return error_response(StatusCode::NOT_FOUND, "cover previously failed");
+    }
+    let Some(thumbs_dir) = THUMBS_DIR.get().cloned() else {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "no cache dir");
+    };
+
+    let lookup = {
+        let zip_path = zip_path.clone();
+        tauri::async_runtime::spawn_blocking(move || read_cached_thumb(&thumbs_dir, &zip_path)).await
+    };
+    let (cache_file, cached) = match lookup {
+        Ok(v) => v,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    if let Some(bytes) = cached {
+        return thumb_response(bytes);
+    }
+
+    let Ok(_permit) = thumb_sem().acquire().await else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "shutting down");
+    };
+    let generated = {
+        let zip_path = zip_path.clone();
+        tauri::async_runtime::spawn_blocking(move || generate_thumb(&zip_path, &cache_file)).await
+    };
+    match generated {
+        Ok(Ok(bytes)) => thumb_response(bytes),
+        Ok(Err(e)) => {
+            lock_ok(failed_thumbs()).insert(zip_path);
+            error_response(StatusCode::NOT_FOUND, &e)
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -558,6 +661,12 @@ pub fn run() {
         .register_asynchronous_uri_scheme_protocol("manga", |_ctx, request, responder| {
             let query = request.uri().query().unwrap_or("").to_string();
             tauri::async_runtime::spawn(async move {
+                // Thumbs and pages hold separate permits: a gallery scroll must
+                // not eat the page budget, and a thumb costs a full-size decode
+                if query_param(&query, "thumb").is_some() {
+                    responder.respond(serve_thumb(&query).await);
+                    return;
+                }
                 let Ok(_permit) = page_sem().acquire().await else {
                     responder.respond(error_response(
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -576,16 +685,15 @@ pub fn run() {
         .setup(|app| {
             use tauri::Manager;
             if let Ok(cache_dir) = app.path().app_cache_dir() {
-                std::thread::spawn(move || clean_thumb_cache(&cache_dir.join("thumbs")));
+                let thumbs_dir = cache_dir.join("thumbs");
+                let sweep = thumbs_dir.clone();
+                std::thread::spawn(move || clean_thumb_cache(&sweep));
+                let _ = THUMBS_DIR.set(thumbs_dir);
             }
             spawn_pool_reaper();
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
-            scan_directory,
-            list_zip_images,
-            load_cover_thumb
-        ])
+        .invoke_handler(tauri::generate_handler![scan_directory, list_zip_images])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -703,6 +811,25 @@ mod tests {
 
         lock_ok(archive_pool()).clear();
         let _ = std::fs::remove_file(&zip_path);
+    }
+
+    #[test]
+    fn thumbs_are_gated_on_scanned_roots() {
+        remember_scan_root(Path::new(r"C:\books"));
+
+        assert!(is_scanned_zip(r"C:\books\a\vol1.cbz"));
+        assert!(is_scanned_zip(r"C:\books\vol1.zip"));
+        // Prefix-string matching would let this through; component matching doesn't
+        assert!(!is_scanned_zip(r"C:\booksXXX\vol1.zip"));
+        assert!(!is_scanned_zip(r"C:\elsewhere\vol1.zip"));
+        // Only archives — the handler must not become a reader for arbitrary files
+        assert!(!is_scanned_zip(r"C:\books\secrets.txt"));
+
+        for i in 0..SCAN_ROOTS_MAX {
+            remember_scan_root(Path::new(&format!(r"C:\other{}", i)));
+        }
+        assert!(!is_scanned_zip(r"C:\books\vol1.zip"));
+        lock_ok(scan_roots()).clear();
     }
 
     #[test]

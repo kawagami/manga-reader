@@ -15,7 +15,6 @@
     "@tauri-apps/plugin-opener": "^2",
     "@tauri-apps/plugin-store": "^2",
     "@tauri-apps/plugin-window-state": "^2",
-    "@types/react-window": "^2.0.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-window": "^2.2.7"

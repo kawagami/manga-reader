@@ -2,6 +2,7 @@ import { useCallback, useMemo, useState } from "react";
 import { CSSProperties } from "react";
 import { CellComponentProps, Grid } from "react-window";
 import { FolderEntry, ZipFileEntry } from "../types";
+import { thumbUrl } from "../utils/pageUrl";
 
 const CARD_W = 150;
 const GAP = 10;
@@ -11,27 +12,36 @@ const ROW_H = 240;
 type MyCellProps = {
   allZips: ZipFileEntry[];
   cols: number;
-  coverImages: Map<string, string>;
   selectedZip: string | null;
   onSelectZip: (path: string) => void;
 };
 
-function GalleryCard({ zip, coverUrl, isSelected, onSelect }: {
+function GalleryCard({ zip, isSelected, onSelect }: {
   zip: ZipFileEntry;
-  coverUrl: string | undefined;
   isSelected: boolean;
   onSelect: () => void;
 }) {
+  const src = thumbUrl(zip.path, zip.mtime);
   return (
     <div
       className={`gallery-card${isSelected ? " gallery-selected" : ""}`}
       onClick={onSelect}
     >
-      {coverUrl ? (
-        <img className="gallery-cover" src={coverUrl} alt="" />
-      ) : (
-        <div className="gallery-placeholder" />
-      )}
+      {/* `loading="lazy"` is what replaces the old onCellsRendered fan-out: the
+          webview requests covers as cells scroll in and evicts them on its own.
+          `.gallery-cover` paints the placeholder colour until the image lands.
+          Keyed by src so React builds a fresh node when the grid recycles this
+          cell — otherwise the cover-failed class below would stick to whatever
+          zip scrolls into the same slot next. */}
+      <img
+        key={src}
+        className="gallery-cover"
+        src={src}
+        alt=""
+        loading="lazy"
+        decoding="async"
+        onError={(e) => e.currentTarget.classList.add("cover-failed")}
+      />
       <span className="gallery-name">{zip.name}</span>
     </div>
   );
@@ -39,7 +49,7 @@ function GalleryCard({ zip, coverUrl, isSelected, onSelect }: {
 
 const CELL_STYLE: CSSProperties = { paddingRight: GAP, paddingBottom: GAP, boxSizing: "border-box" };
 
-function GridCell({ ariaAttributes, columnIndex, rowIndex, style, allZips, cols, coverImages, selectedZip, onSelectZip }: CellComponentProps<MyCellProps>) {
+function GridCell({ ariaAttributes, columnIndex, rowIndex, style, allZips, cols, selectedZip, onSelectZip }: CellComponentProps<MyCellProps>) {
   const idx = rowIndex * cols + columnIndex;
   if (idx >= allZips.length) return <div style={style} />;
   const zip = allZips[idx];
@@ -47,7 +57,6 @@ function GridCell({ ariaAttributes, columnIndex, rowIndex, style, allZips, cols,
     <div style={{ ...style, ...CELL_STYLE }} {...ariaAttributes}>
       <GalleryCard
         zip={zip}
-        coverUrl={coverImages.get(zip.path)}
         isSelected={selectedZip === zip.path}
         onSelect={() => onSelectZip(zip.path)}
       />
@@ -57,13 +66,11 @@ function GridCell({ ariaAttributes, columnIndex, rowIndex, style, allZips, cols,
 
 interface Props {
   folders: FolderEntry[];
-  coverImages: Map<string, string>;
   selectedZip: string | null;
   onSelectZip: (path: string) => void;
-  onLoadCover: (zipPath: string) => Promise<void>;
 }
 
-export function Gallery({ folders, coverImages, selectedZip, onSelectZip, onLoadCover }: Props) {
+export function Gallery({ folders, selectedZip, onSelectZip }: Props) {
   const allZips = useMemo(() => folders.flatMap((f) => f.zip_files), [folders]);
   // null until the container mounts — rendering the grid with a guessed width
   // would flash a wrong column count on first paint. Callback ref measures
@@ -83,21 +90,9 @@ export function Gallery({ folders, coverImages, selectedZip, onSelectZip, onLoad
     setContainerWidth(width);
   }, []);
 
-  const handleCellsRendered = useCallback((
-    _visible: { columnStartIndex: number; columnStopIndex: number; rowStartIndex: number; rowStopIndex: number },
-    all: { columnStartIndex: number; columnStopIndex: number; rowStartIndex: number; rowStopIndex: number },
-  ) => {
-    for (let r = all.rowStartIndex; r <= all.rowStopIndex; r++) {
-      for (let c = all.columnStartIndex; c <= all.columnStopIndex; c++) {
-        const idx = r * cols + c;
-        if (idx < allZips.length) onLoadCover(allZips[idx].path);
-      }
-    }
-  }, [cols, allZips, onLoadCover]);
-
   const cellProps: MyCellProps = useMemo(
-    () => ({ allZips, cols, coverImages, selectedZip, onSelectZip }),
-    [allZips, cols, coverImages, selectedZip, onSelectZip],
+    () => ({ allZips, cols, selectedZip, onSelectZip }),
+    [allZips, cols, selectedZip, onSelectZip],
   );
 
   if (allZips.length === 0) {
@@ -120,7 +115,6 @@ export function Gallery({ folders, coverImages, selectedZip, onSelectZip, onLoad
           cellComponent={GridCell}
           cellProps={cellProps}
           onResize={handleResize}
-          onCellsRendered={handleCellsRendered}
           style={{ height: "100%", width: "100%" }}
         />
       )}

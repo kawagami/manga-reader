@@ -399,17 +399,19 @@ button:disabled {
   border-color: var(--accent) !important;
 }
 
+/* Covers are lazy <img>s straight to the manga:// scheme, so the box has to be
+   painted before one arrives — hence the background instead of a separate
+   placeholder element. Failed covers keep the box and hide the broken glyph. */
 .gallery-cover {
   width: 150px;
   height: 200px;
   object-fit: cover;
   display: block;
+  background: #1a1a1a;
 }
 
-.gallery-placeholder {
-  width: 150px;
-  height: 200px;
-  background: #1a1a1a;
+.cover-failed {
+  visibility: hidden;
 }
 
 .gallery-name {

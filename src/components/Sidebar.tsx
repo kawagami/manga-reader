@@ -13,6 +13,10 @@ interface SidebarProps {
   folders: FolderEntry[];
   selectedZip: string | null;
   onSelectZip: (path: string) => void;
+  // Owned by App: gallery mode unmounts this component, so state held here
+  // would be discarded every time the user switched to the covers and back.
+  expanded: Set<string>;
+  setExpanded: React.Dispatch<React.SetStateAction<Set<string>>>;
 }
 
 interface ContextMenu {
@@ -81,8 +85,7 @@ function SidebarRow({
   );
 }
 
-export function Sidebar({ folders, selectedZip, onSelectZip }: SidebarProps) {
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+export function Sidebar({ folders, selectedZip, onSelectZip, expanded, setExpanded }: SidebarProps) {
   const [ctxMenu, setCtxMenu] = useState<ContextMenu | null>(null);
   const listRef = useListRef(null);
   const scrolledZipRef = useRef<string | null>(null);
@@ -112,7 +115,7 @@ export function Sidebar({ folders, selectedZip, onSelectZip }: SidebarProps) {
       next.add(parent.path);
       return next;
     });
-  }, [selectedZip, folders]);
+  }, [selectedZip, folders, setExpanded]);
 
   // Scroll the selection into view once its folder has expanded. The row may
   // not be mounted, so this goes through the list's imperative API rather than
@@ -147,7 +150,7 @@ export function Sidebar({ folders, selectedZip, onSelectZip }: SidebarProps) {
       else next.add(path);
       return next;
     });
-  }, []);
+  }, [setExpanded]);
 
   const onZipContextMenu = useCallback(
     (e: React.MouseEvent, zipPath: string) => {
