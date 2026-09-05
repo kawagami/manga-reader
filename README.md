@@ -18,8 +18,8 @@
 | `←` / `↑` / `Numpad4` | 上一頁 |
 | `→` / `↓` / `Numpad6` | 下一頁 |
 | `Space` | 下一頁 |
-| `PageUp` / `Numpad7` | 往前 5 頁 |
-| `PageDown` / `Numpad9` | 往後 5 頁 |
+| `PageUp` / `Numpad7` | 往前 5 個跨頁（單頁模式 5 頁、雙頁模式 10 頁）|
+| `PageDown` / `Numpad9` | 往後 5 個跨頁（單頁模式 5 頁、雙頁模式 10 頁）|
 | `Alt+↑` / `Numpad8` | 上一個 zip |
 | `Alt+↓` / `Numpad5` | 下一個 zip |
 | `Numpad0` | 隨機跳到一個 zip |

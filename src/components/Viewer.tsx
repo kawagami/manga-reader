@@ -167,7 +167,8 @@ export function Viewer({
               const src = srcFor(name);
               // imgLandscape gains an entry exactly when the image finishes
               // loading, so it doubles as the "loaded" flag. Cheap here — a
-              // paged view only ever holds ~13 images.
+              // paged view holds ~13 images in single mode, ~38 at most in
+              // double (12 backward spreads + active + 6 forward, ×2 halves).
               const loaded = imgLandscape.has(name);
               return (
                 <div key={src} className="page-slot">

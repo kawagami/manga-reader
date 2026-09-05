@@ -161,9 +161,11 @@ button:disabled {
   text-align: center;
 }
 
-/* Heights are pinned here, not derived from content: react-window has to know
-   a row's height before rendering it. ROW_H_FOLDER / ROW_H_ZIP in Sidebar.tsx
-   must match (31px / 27px, borders included). */
+/* react-window has to know a row's height before rendering it, so the row box
+   is sized by ROW_H_FOLDER / ROW_H_ZIP in Sidebar.tsx (31px / 27px, borders
+   included) and these rules just fill it (height: 100%). Padding, line-height
+   and borders here must add up to those constants — changing one means
+   changing the other. */
 .folder-header {
   display: flex;
   align-items: center;
