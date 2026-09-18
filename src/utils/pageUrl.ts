@@ -2,7 +2,8 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 
 // Pages are served by the Rust `manga` URI scheme handler rather than shipped
 // over IPC as ArrayBuffers, so the webview owns fetching, decode scheduling and
-// memory eviction — that is what makes `loading="lazy"` work in scroll mode.
+// memory eviction — that is what makes `loading="lazy"` work in scroll mode
+// and the gallery.
 //
 // convertFileSrc("") yields just the protocol origin: "http://manga.localhost/"
 // on Windows, "manga://localhost/" elsewhere. Resolved lazily because the Tauri

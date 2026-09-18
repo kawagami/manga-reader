@@ -30,9 +30,10 @@ function GalleryCard({ zip, isSelected, onSelect }: {
       {/* `loading="lazy"` is what replaces the old onCellsRendered fan-out: the
           webview requests covers as cells scroll in and evicts them on its own.
           `.gallery-cover` paints the placeholder colour until the image lands.
-          Keyed by src so React builds a fresh node when the grid recycles this
-          cell — otherwise the cover-failed class below would stick to whatever
-          zip scrolls into the same slot next. */}
+          Keyed by src because the grid keys cells by position, not by zip: a
+          resize that changes the column count, or a rescan, puts a different
+          zip into the same cell node, and the cover-failed class below would
+          otherwise stick to it. */}
       <img
         key={src}
         className="gallery-cover"

@@ -430,8 +430,9 @@ fn thumb_cache_key(path: &str, mtime_secs: u64) -> String {
     format!("{:016x}", h)
 }
 
-// Guards the full-size decode that precedes downscaling: a 4000x6000 source is
-// ~96 MB as RGBA, and four of those in parallel would spike past 400 MB.
+// Guards the full-size decode that precedes downscaling. Even a normal 4000x6000
+// source is ~96 MB as RGBA (~384 MB with four in parallel under THUMB_SEM); the
+// limits reject corrupt or hostile headers that claim far larger dimensions.
 fn decode_limited(raw: &[u8]) -> Result<image::DynamicImage, String> {
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(256 * 1024 * 1024);
@@ -503,12 +504,12 @@ fn generate_thumb(zip_path: &str, cache_file: &Path) -> Result<Vec<u8>, String> 
 }
 
 // ---------------------------------------------------------------------------
-// manga:// page protocol
+// manga:// protocol (pages and gallery covers)
 //
-// Pages go straight to <img src> instead of being shipped over IPC as
-// ArrayBuffers. The webview then owns fetching, decode scheduling and memory
-// eviction — which is what makes `loading="lazy"` viable in scroll mode and
-// removes the need for a hand-rolled load window on the frontend.
+// Pages and covers go straight to <img src> instead of being shipped over IPC
+// as ArrayBuffers. The webview then owns fetching, decode scheduling and memory
+// eviction — which is what makes `loading="lazy"` viable in scroll mode and the
+// gallery, and removes the need for a hand-rolled load window on the frontend.
 // ---------------------------------------------------------------------------
 
 fn mime_for(name: &str) -> &'static str {
