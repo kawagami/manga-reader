@@ -190,7 +190,7 @@ export function Viewer({
                         className="page-img"
                         // Backward spreads come first in DOM order, so after a
                         // jump the page being read would queue behind up to 12
-                        // preloads. Order can't be changed (it keeps React from
+                        // backward spreads (24 images in double mode). Order can't be changed (it keeps React from
                         // moving nodes on every turn) — priority can.
                         fetchPriority={isActive ? "high" : "auto"}
                         onLoad={(e) => {

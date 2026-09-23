@@ -251,8 +251,9 @@ fn is_image_file(name: &str) -> bool {
             .and_then(|e| e.to_str())
             .map(|e| e.to_lowercase())
             .as_deref(),
-        // avif decodes in the webview; cover thumbs for avif may fail (image
-        // crate needs a native decoder) and fall back to the placeholder
+        // avif decodes in the webview, but avif covers always fail: the image
+        // crate's default `avif` feature only encodes (decoding needs
+        // `avif-native`/dav1d), so those cards fall back to the placeholder
         Some("jpg") | Some("jpeg") | Some("png") | Some("webp") | Some("gif")
             | Some("bmp") | Some("avif")
     )
