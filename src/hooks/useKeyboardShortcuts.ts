@@ -16,12 +16,22 @@ export interface KeyBinding {
   handler: () => void | boolean;
 }
 
+const isTextField = (t: EventTarget | null) =>
+  t instanceof HTMLElement &&
+  (t.isContentEditable || t.tagName === "INPUT" || t.tagName === "TEXTAREA");
+
 export function useKeyboardShortcuts(bindings: KeyBinding[]) {
   const ref = useRef(bindings);
   ref.current = bindings;
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // Typing in a text field (the sidebar search) must not turn pages or
+      // jump zips — Space/arrows/numpad digits are text there. Ctrl/Alt/Meta
+      // combos aren't typing, so they still go through (Ctrl+F while already
+      // in the box must not fall through to WebView2's own find bar).
+      if (e.isComposing) return;
+      if (isTextField(e.target) && !(e.ctrlKey || e.altKey || e.metaKey)) return;
       for (const b of ref.current) {
         const modMatch =
           (b.alt ?? false) === e.altKey &&

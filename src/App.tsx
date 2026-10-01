@@ -24,6 +24,10 @@ function App() {
   // Lives here, not in Sidebar: gallery mode unmounts the sidebar, and folder
   // state kept inside it was wiped every time the user looked at the covers.
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
+  // Same reason: kept across gallery round-trips. Survives a root change too —
+  // unlike folder paths, a search term still means something in a new root.
+  const [sidebarQuery, setSidebarQuery] = useState("");
+  const searchRef = useRef<HTMLInputElement>(null);
   const [isDragOver, setIsDragOver] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const noticeTimerRef = useRef<number | undefined>(undefined);
@@ -174,6 +178,8 @@ function App() {
   };
 
   useKeyboardShortcuts([
+    // No-op in gallery mode (no sidebar mounted), but still claims the key
+    { code: "KeyF", ctrl: true, handler: () => { searchRef.current?.select(); } },
     { code: "Numpad0", handler: () => {
       if (flat.length === 0) return;
       openZip(flat[Math.floor(Math.random() * flat.length)]);
@@ -257,6 +263,9 @@ function App() {
               onSelectZip={selectZip}
               expanded={expandedFolders}
               setExpanded={setExpandedFolders}
+              query={sidebarQuery}
+              onQueryChange={setSidebarQuery}
+              searchRef={searchRef}
             />
             <Viewer
               images={images}
