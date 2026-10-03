@@ -198,9 +198,10 @@ button:disabled {
 
 /* react-window has to know a row's height before rendering it, so the row box
    is sized by ROW_H_FOLDER / ROW_H_ZIP in Sidebar.tsx (31px / 27px, borders
-   included) and these rules just fill it (height: 100%). Padding, line-height
-   and borders here must add up to those constants — changing one means
-   changing the other. */
+   included) and these rules just fill it (height: 100%), so padding and borders
+   here can't change a row's height. The one coupling: .zip-item's line-height
+   (26px) is ROW_H_ZIP minus its 1px border, to centre the text — change both
+   together. .folder-header centres via flex and needs no matching value. */
 .folder-header {
   display: flex;
   align-items: center;
