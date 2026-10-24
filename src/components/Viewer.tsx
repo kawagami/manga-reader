@@ -37,8 +37,8 @@ export function Viewer({
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
   }, [images]);
 
-  // Track the page at the viewport centre so switching scroll → single keeps
-  // the reading position. An IntersectionObserver whose root is collapsed to a
+  // Track the page at the viewport centre so switching scroll → single/double
+  // keeps the reading position. An IntersectionObserver whose root is collapsed to a
   // line at the centre reports this in O(1); the old scroll handler walked
   // every page element on each frame and read offsetTop, forcing layout.
   useEffect(() => {
@@ -190,8 +190,9 @@ export function Viewer({
                         className="page-img"
                         // Backward spreads come first in DOM order, so after a
                         // jump the page being read would queue behind up to 12
-                        // backward spreads (24 images in double mode). Order can't be changed (it keeps React from
-                        // moving nodes on every turn) — priority can.
+                        // backward spreads (24 images in double mode). Order
+                        // can't be changed (it keeps React from moving nodes on
+                        // every turn) — priority can.
                         fetchPriority={isActive ? "high" : "auto"}
                         onLoad={(e) => {
                           const el = e.currentTarget;

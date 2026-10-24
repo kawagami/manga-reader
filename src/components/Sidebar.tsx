@@ -4,10 +4,10 @@ import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { FolderEntry, ZipFileEntry } from "../types";
 import { normalize, parseQuery, matchScore } from "../utils/search";
 
-// Must match .folder-header / .zip-item in App.css. react-window needs a row's
-// height before it renders it, so the row box is sized from these constants
-// and the CSS just fills it (height: 100%) instead of padding + line-height
-// deciding it.
+// react-window needs a row's height before it renders it, so these constants
+// alone size the row box; .folder-header / .zip-item in App.css just fill it
+// (height: 100%) and can't change it. The one coupling: .zip-item's
+// line-height (26px) is ROW_H_ZIP minus its 1px border — change both together.
 const ROW_H_FOLDER = 31;
 const ROW_H_ZIP = 27;
 

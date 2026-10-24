@@ -333,7 +333,8 @@ button:disabled {
   aspect-ratio: 2 / 3;
 }
 
-/* placeholder while loading */
+/* "Loading…" beside an unloaded paged image, or "Failed to load" in place of
+   a failed one */
 .page-placeholder {
   width: 400px;
   height: 500px;
@@ -345,8 +346,9 @@ button:disabled {
   background: #0d0d0d;
 }
 
-/* In scroll mode the placeholder replaces a full-width page, so it has to
-   reserve the same box the image would have */
+/* Scroll mode only shows a placeholder for a failed page (no "Loading…" —
+   .scroll-img's own reserved box covers that). It replaces a full-width page,
+   so it reserves the same box the image would have */
 .scroll-page .page-placeholder {
   width: 100%;
   height: auto;

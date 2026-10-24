@@ -6,8 +6,10 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 // and the gallery.
 //
 // convertFileSrc("") yields just the protocol origin: "http://manga.localhost/"
-// on Windows, "manga://localhost/" elsewhere. Resolved lazily because the Tauri
-// internals it reads are injected before the bundle runs, not before import.
+// on Windows, "manga://localhost/" elsewhere. Resolved lazily (then cached) so
+// importing this module never touches window.__TAURI_INTERNALS__: it exists
+// only inside the Tauri webview, and an eager call would throw at import time
+// anywhere else (a plain browser tab on the Vite dev server, tests).
 let origin: string | null = null;
 function protocolOrigin(): string {
   return (origin ??= convertFileSrc("", "manga"));
