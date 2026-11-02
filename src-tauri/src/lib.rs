@@ -11,8 +11,9 @@ use tokio::sync::Semaphore;
 use walkdir::WalkDir;
 
 // A panicking reader would otherwise poison the lock and turn every later
-// page request into a panic. The data behind these mutexes is a plain cache —
-// recovering the inner value is always safe.
+// page request into a panic. The data behind these mutexes is caches and small
+// allow-lists whose updates are single steps — a half-finished one can at worst
+// drop an entry, never widen a gate — so recovering the inner value is safe.
 fn lock_ok<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -216,8 +217,8 @@ fn natural_sort_cmp(a: &str, b: &str) -> std::cmp::Ordering {
             }
         } else {
             match (a_iter.next(), b_iter.next()) {
-                // Full-string tiebreak keeps order deterministic when runs differ
-                // only in leading zeros ("01" vs "1")
+                // Full-string tiebreak keeps order deterministic when names differ
+                // only in leading zeros ("01" vs "1") or ASCII case ("A" vs "a")
                 (None, None) => return a.cmp(b),
                 (None, _) => return std::cmp::Ordering::Less,
                 (_, None) => return std::cmp::Ordering::Greater,
@@ -572,8 +573,9 @@ fn serve_page(query: &str) -> HttpResponse<Vec<u8>> {
         Ok(a) => a,
         Err(e) => return error_response(StatusCode::NOT_FOUND, &e),
     };
-    // Read, then hand the archive back before branching — an in-scope ZipFile
-    // keeps the archive borrowed and blocks the pool return
+    // Hand the archive back before branching on the result, so a missing entry
+    // doesn't cost a pooled handle. read_entry confines the ZipFile borrow, which
+    // must end before return_archive can take the archive.
     let read = read_entry(&mut archive, &name);
     return_archive(&zip_path, archive);
     let bytes = match read {
@@ -740,8 +742,9 @@ mod tests {
         assert_eq!(v, vec!["1.jpg", "002.jpg", "9.jpg", "10.jpg"]);
     }
 
-    // Builds a zip holding one real page plus the macOS shadow entries that
-    // used to slip through the extension check.
+    // Builds a zip holding two real pages (stored out of order, so the listing
+    // has to sort them) plus a macOS shadow entry of the kind that used to slip
+    // through the extension check.
     fn write_fixture_zip() -> std::path::PathBuf {
         use std::io::Write;
         let path = std::env::temp_dir().join(format!(
