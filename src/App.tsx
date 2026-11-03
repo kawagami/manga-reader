@@ -7,7 +7,7 @@ import { FolderEntry, ViewMode } from "./types";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useZipLoader } from "./hooks/useZipLoader";
 import { saveSetting, loadSetting } from "./utils/store";
-import { spreadStride } from "./utils/spread";
+import { lastSpreadStart, spreadStride } from "./utils/spread";
 import { Sidebar } from "./components/Sidebar";
 import { Viewer } from "./components/Viewer";
 import { Gallery } from "./components/Gallery";
@@ -132,6 +132,10 @@ function App() {
   }, [scanDir, selectZip, showNotice]);
 
   const effectiveStride = spreadStride(images, imgLandscape, currentPage, viewMode === "double");
+  const lastPage = useMemo(
+    () => lastSpreadStart(images, imgLandscape, viewMode === "double"),
+    [images, imgLandscape, viewMode],
+  );
 
   // Advance only if the next spread starts on a real page — stops the last
   // spread from re-showing its final page alone in double mode
@@ -172,9 +176,19 @@ function App() {
   const pagedMode = viewMode === "single" || viewMode === "double";
 
   // Returning false leaves the event to the browser (native scrolling in scroll mode)
+  // Forward clamps to lastPage, not images.length - 1, so a jump near the end
+  // lands on the real last spread; Math.max(p, …) keeps it from moving backwards
+  // if the current page is already past it
   const jumpPage = (delta: number) => {
     if (!pagedMode) return false;
-    setCurrentPage((p) => Math.max(0, Math.min(p + delta, images.length - 1)));
+    setCurrentPage((p) =>
+      delta < 0 ? Math.max(0, p + delta) : Math.max(p, Math.min(p + delta, lastPage)),
+    );
+  };
+
+  const goToPage = (page: number) => {
+    if (!pagedMode) return false;
+    setCurrentPage(page);
   };
 
   useKeyboardShortcuts([
@@ -192,6 +206,10 @@ function App() {
     { code: "PageDown",            handler: () => jumpPage(+effectiveStride * 5) },
     { code: "Numpad7",             handler: () => jumpPage(-effectiveStride * 5) },
     { code: "Numpad9",             handler: () => jumpPage(+effectiveStride * 5) },
+    { code: "Home",                handler: () => goToPage(0) },
+    { code: "End",                 handler: () => goToPage(lastPage) },
+    { code: "Numpad1",             handler: () => goToPage(0) },
+    { code: "Numpad3",             handler: () => goToPage(lastPage) },
     { code: "Numpad4",             handler: () => pagedMode ? goPrev() : false },
     { code: "Numpad6",             handler: () => pagedMode ? goNext() : false },
     { key: "ArrowRight",           handler: () => pagedMode ? goNext() : false },

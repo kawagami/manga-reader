@@ -18,3 +18,19 @@ export function spreadStride(
   if (landscape.get(images[page + 1]) === true) return 1;
   return 2;
 }
+
+// Where paging forward from page 0 comes to rest — the "last page" target.
+// Clamping to images.length - 1 instead shows the final page alone in double
+// mode and shifts every spread's pairing by one on the way back.
+export function lastSpreadStart(
+  images: string[],
+  landscape: Map<string, boolean>,
+  doubleMode: boolean,
+): number {
+  let p = 0;
+  for (;;) {
+    const next = p + spreadStride(images, landscape, p, doubleMode);
+    if (next > images.length - 1) return p;
+    p = next;
+  }
+}
