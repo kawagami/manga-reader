@@ -27,6 +27,7 @@ shared with the backend.
 - `sidebarQuery` / `searchRef` — sidebar search text and its `<input>` (for `Ctrl+F`). App-owned
   for the same gallery-unmount reason; **not** cleared on root change
 - `effectiveStride` — `spreadStride(images, imgLandscape, currentPage, viewMode === "double")`
+- `lastPage` — `useMemo`'d `lastSpreadStart(...)`: target of `End`/`Numpad3` and the clamp for forward jumps
 - `flat` / `zipIndex` — `useMemo`'d flattened zip paths + path→index map for zip navigation
 
 ## State (useZipLoader hook)
@@ -35,15 +36,17 @@ which pages exist and what has been learned about them:
 - `zip` — single `{ path, mtime, names }` state object, so the swap to a new zip is atomic
 - `images` — `zip?.names ?? NO_IMAGES` (stable empty array so effects don't refire)
 - `srcFor(name)` — `pageUrl(zip.path, name, zip.mtime)`
-- `imgLandscape` — `Map<name, boolean>`, set from `<img onLoad>`. Doubles as the "loaded"
-  flag in paged mode (drives the "Loading…" placeholder)
+- `imgLandscape` — `Map<name, boolean>`, set from the **paged-mode** `<img onLoad>` (scroll-mode
+  pages don't report orientation). Doubles as the "loaded" flag in paged mode (drives the
+  "Loading…" placeholder)
 - `failedPages` — `Set<name>` from `<img onError>`; Viewer shows "Failed to load"
 - `zipError` — zip open failure (also "No images found in this zip" for empty zips — the
   default "Select a zip file" message would be wrong there), shown in Viewer
 - `activeZipRef` — guards against a slow listing for zip A landing after the user opened B
 
 ## Zip switch flow
-`selectZip(path)` in App.tsx sets `selectedZip`, then delegates to `useZipLoader.selectZip(path, onSwap)`:
+`selectZip(path)` in App.tsx sets `selectedZip`, then delegates to `useZipLoader.selectZip(path, onSwap)`
+(destructured as `loadZip` in App):
 1. `activeZipRef.current = path`
 2. `invoke("list_zip_images", { zipPath })` → `{ names, mtime }`
 3. `new Image()` + `decode()` on page 0's URL — the old zip stays on screen instead of
@@ -54,7 +57,8 @@ which pages exist and what has been learned about them:
    calls `onSwap()` — the page URLs are identical, so mounted `<img>`s never re-fire `onLoad`, and
    clearing `imgLandscape` (the paged-mode "loaded" flag) would leave every page stuck on "Loading…"
 5. Every step re-checks `activeZipRef.current === path` (stale guard)
-6. On error: `setZip(null)` + `zipError` → Viewer shows the error
+6. On error: `setZip(null)` + cleared landscape/failed maps + `zipError`, then `onSwap()` → Viewer
+   shows the error
 
 ## Gallery covers
 No hook and no state: `<img src={thumbUrl(zip.path, zip.mtime)} loading="lazy">`.
@@ -81,7 +85,7 @@ Window size/position: `tauri-plugin-window-state` (auto-saves on close, `restore
 | Mode   | Behaviour |
 |--------|-----------|
 | single | One page centered. ←/↑ previous, →/↓/Space next. |
-| double | Two pages side-by-side, **right-to-left** (manga order): page N on right, N+1 on left. stride = 2. A spread collapses to a single page when **either** half is landscape (`spreadStride`). Paged mode pre-renders 6 spreads forward (orientation-aware stride) at `opacity: 0`, so turning a page is just an opacity flip on already-decoded images. Backwards it pre-renders *every* page within reach of 6 spreads (`stride × 6` → 12 pages in double, 6 in single), because a landscape page shifts parity and stride-2 skipping backwards would miss reachable pages — so a double-mode view holds up to ~19 spreads / ~38 `<img>`. **Never `display: none` a page `<img>`** — hidden images are not decoded, which silently defeats the preload and makes every page turn flicker; the "Loading…" placeholder therefore renders *beside* the img (0×0 until loaded), not in place of it. Backward spreads come first in DOM order, so the active spread carries `fetchPriority="high"` to avoid queueing behind preloads after a jump. |
+| double | Two pages side-by-side, **right-to-left** (manga order): page N on right, N+1 on left. stride = 2. A spread collapses to a single page when **either** half is landscape (`spreadStride`). Paged mode pre-renders 6 spreads forward (orientation-aware stride) at `opacity: 0`, so turning a page is just an opacity flip on already-decoded images. Backwards it pre-renders *every* page within reach of 6 spreads (a fixed `(double ? 2 : 1) × 6` → 12 pages in double, 6 in single, regardless of the current stride), because a landscape page shifts parity and stride-2 skipping backwards would miss reachable pages — so a double-mode view holds up to ~19 spreads / ~38 `<img>`. **Never `display: none` a page `<img>`** — hidden images are not decoded, which silently defeats the preload and makes every page turn flicker; the "Loading…" placeholder therefore renders *beside* the img (0×0 until loaded), not in place of it. Backward spreads come first in DOM order, so the active spread carries `fetchPriority="high"` to avoid queueing behind preloads after a jump. |
 | scroll | All pages stacked vertically, native scroll + `loading="lazy"` — the webview decides what to fetch and evict. `.scroll-img` reserves a `2/3` aspect box so lazily-arriving pages don't shove everything below them; `onLoad` clears it to `auto` imperatively (a state update would re-render all N page nodes). Current page comes from an `IntersectionObserver` whose root is collapsed to a line at the viewport centre (`rootMargin: -50% 0 -50%`) — O(1), no per-page `offsetTop` reads. Position carries scroll → paged only: entering scroll mode starts at the top and the observer immediately reports page 0, overwriting `currentPage` (known gap). |
 | gallery | Cover thumbnail grid for all zips (react-window virtual grid). Click → open in double mode. Covers are plain lazy `<img>`s on the `manga://` scheme (`?thumb=1`). Zip-nav keys (Numpad0/8/5, Alt+↑↓) also open in double mode. |
 
@@ -92,8 +96,8 @@ must be up); a handler returning `false` declines the event (no `preventDefault`
 aimed at input/textarea/contentEditable are ignored (Ctrl/Alt/Meta combos still fire), as is IME
 composition.
 
-Page keys act only in single/double mode; in scroll mode the handler returns `false`, so the
-browser's native scrolling handles them. Zip keys work in every mode.
+Page keys act only in single/double mode; in scroll and gallery mode the handler returns `false`,
+so the browser's native scrolling handles them. Zip keys work in every mode.
 
 | Key | Action |
 |-----|--------|
@@ -109,7 +113,7 @@ browser's native scrolling handles them. Zip keys work in every mode.
 | `Alt+↑` / `Numpad8` | Previous zip (cross-folder, sidebar order) |
 | `Alt+↓` / `Numpad5` | Next zip (cross-folder, sidebar order) |
 | `Numpad0` | Random zip from loaded tree (uniform over zips, with replacement) |
-| `Ctrl+F` | Focus sidebar search (no-op in gallery) |
+| `Ctrl+F` | Focus sidebar search and select its text (no-op in gallery, but still claims the key so WebView2's find bar doesn't open) |
 
 Zip nav / random use the **whole** tree, not the search results. Inside the search box: `Enter`
 opens the first result and blurs, `Esc` clears and blurs — both hand the keys back to the reader.

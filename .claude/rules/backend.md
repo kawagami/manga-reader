@@ -14,7 +14,7 @@ shared with the frontend.
 - `image = "0.25"` — decode images + resize for thumbnails (default features: avif is encode-only,
   so avif covers always fail and fall back to the placeholder; pages still render in the webview)
 - `tokio = { version = "1", features = ["sync"] }` — `Semaphore` to cap concurrent thumbnail/page jobs
-- `percent-encoding = "2"` — decode query params in the `manga://` page protocol
+- `percent-encoding = "2"` — decode query params in the `manga://` protocol (pages and covers)
 - `tauri-plugin-dialog = "2"` — native folder picker
 - `tauri-plugin-store = "2"` — persist settings to JSON
 - `tauri-plugin-window-state = "2"` — save/restore window size+position
