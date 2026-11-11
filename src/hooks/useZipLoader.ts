@@ -27,6 +27,8 @@ export function useZipLoader() {
 
   // Guards against a slow listing for zip A landing after the user opened B
   const activeZipRef = useRef<string | null>(null);
+  // Mirror of `zip` readable from the stable selectZip callback
+  const zipRef = useRef<OpenZip | null>(null);
 
   const selectZip = useCallback(async (path: string, onSwap?: () => void) => {
     activeZipRef.current = path;
@@ -37,6 +39,7 @@ export function useZipLoader() {
       listing = await invoke<ZipListing>("list_zip_images", { zipPath: path });
     } catch (e) {
       if (activeZipRef.current !== path) return;
+      zipRef.current = null;
       setZip(null);
       setImgLandscape(new Map());
       setFailedPages(new Set());
@@ -47,7 +50,18 @@ export function useZipLoader() {
     if (activeZipRef.current !== path) return;
 
     const swap = () => {
-      setZip({ path, mtime: listing.mtime, names: listing.names });
+      // Reopening the zip already on screen (same path + mtime) yields the
+      // exact same page URLs, so the mounted <img>s keep their src and never
+      // fire onLoad again. Clearing imgLandscape — the paged-mode "loaded"
+      // flag — would then leave every page stuck on "Loading…".
+      const cur = zipRef.current;
+      if (cur && cur.path === path && cur.mtime === listing.mtime) {
+        onSwap?.();
+        return;
+      }
+      const next = { path, mtime: listing.mtime, names: listing.names };
+      zipRef.current = next;
+      setZip(next);
       setImgLandscape(new Map());
       setFailedPages(new Set());
       onSwap?.();
