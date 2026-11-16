@@ -22,6 +22,9 @@ shared with the frontend.
   first in `run()`; otherwise two instances race on settings.json, window-state and the thumb cache).
   Rust-only, no capability needed
 - `tauri-plugin-opener = "2"` — reveal file in Explorer
+- `trash = "5"` — move zips to the Recycle Bin (`trash_zip`). On Windows it uses `IFileOperation`
+  with `FOF_NO_UI | FOF_ALLOWUNDO | FOF_WANTNUKEWARNING`: a file too big for the bin **fails**
+  instead of being silently deleted for good
 - `serde = "1"` (derive) — command return types; `serde_json = "1"` is a Tauri-template leftover,
   not referenced anywhere in `lib.rs`
 
@@ -45,6 +48,29 @@ sorts first and becomes an undecodable cover.
 `mtime` is the cache-busting version the frontend puts in page URLs.
 Sets `CURRENT_ZIP`, pushes the path onto `OPENED_ZIPS` (the page gate), and drops the previous
 zip's pooled handles immediately.
+
+### `find_duplicates(path: String, on_progress: Channel<DupeProgress>) -> Result<DupeReport, String>`
+In `dupes.rs`. `path` must equal a `SCAN_ROOTS` entry (the report's covers are served through
+`serve_thumb` anyway). Walks .zip/.cbz sequentially (one disk — parallel tail reads only add
+seeking), sends `{done, total}` every 50 files.
+Per archive, `read_page_keys` parses the **central directory by hand**: EOCD (searching back over a
+≤64 KiB comment), zip64 locator/record when a field is saturated, then one read of the whole
+directory; keys are `(crc32, uncompressed size)` of `is_page_entry` names, sorted. Not
+`zip::ZipArchive::by_index_raw` — that seeks to every entry's local header (~150 seeks per
+archive; minutes on a HDD). If the recorded directory offset doesn't land on a `PK\x01\x02` header
+(data prepended), it falls back to `end record − cd_size`. No EOCD → reported as broken (this is
+what an incomplete download looks like: starts with `PK\x03\x04`, no directory).
+`DupeReport`: `items` (only archives referenced below), `identical` (groups with equal key lists,
+sorted by reclaimable bytes), `overlaps` (pairs sharing ≥5 distinct pages and ≥60% of the smaller
+one's; pages found in >15 archives are ignored as credit/ad pages; `a` = larger, `subset` = all
+of `b` in `a`; `a_unique`/`b_unique` are distinct counts, since `pages` counts entries),
+`broken`, `no_images`. ~3 s for 4.2k zips on a warm cache.
+Manual check: `DUPES_ROOT=D:\comic cargo test --lib dupes::tests::real_library -- --ignored --nocapture`.
+
+### `trash_zip(path: String) -> Result<(), String>`
+Gate: `is_scanned_zip` (same as covers). Clears `CURRENT_ZIP` if it is this zip (so an in-flight
+read's `return_archive` drops its handle) and evicts its pooled handles — they hold the Windows
+file lock — then `trash::delete`.
 
 ## `manga://` protocol (not a command)
 
@@ -115,7 +141,7 @@ would otherwise poison the mutex and turn every later page request into a panic.
 
 ## Capabilities (src-tauri/capabilities/default.json)
 ```json
-["core:default", "opener:default", "dialog:allow-open", "store:default", "window-state:default"]
+["core:default", "opener:default", "dialog:allow-open", "dialog:allow-ask", "store:default", "window-state:default"]
 ```
 
 ## CSP (tauri.conf.json → app.security)

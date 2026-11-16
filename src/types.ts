@@ -11,3 +11,38 @@ export interface FolderEntry {
 }
 
 export type ViewMode = "single" | "double" | "scroll" | "gallery";
+
+// find_duplicates report — see src-tauri/src/dupes.rs. Groups and pairs hold
+// indices into `items`.
+export interface DupeItem {
+  path: string;
+  name: string;
+  folder: string;
+  size: number;
+  mtime: number;
+  pages: number;
+}
+
+export interface OverlapPair {
+  a: number; // the archive with more pages
+  b: number;
+  shared: number;
+  a_unique: number; // distinct pages — `pages` counts entries, incl. repeated images
+  b_unique: number;
+  subset: boolean; // every page of b is in a
+}
+
+export interface DupeReport {
+  items: DupeItem[];
+  identical: number[][];
+  overlaps: OverlapPair[];
+  broken: { item: number; error: string }[];
+  no_images: number[];
+  scanned: number;
+  elapsed_ms: number;
+}
+
+export interface DupeProgress {
+  done: number;
+  total: number;
+}

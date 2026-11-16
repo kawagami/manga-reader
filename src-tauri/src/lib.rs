@@ -10,6 +10,8 @@ use tauri::http::{header, Response as HttpResponse, StatusCode};
 use tokio::sync::Semaphore;
 use walkdir::WalkDir;
 
+mod dupes;
+
 // A panicking reader would otherwise poison the lock and turn every later
 // page request into a panic. The data behind these mutexes is caches and small
 // allow-lists whose updates are single steps — a half-finished one can at worst
@@ -403,6 +405,50 @@ async fn list_zip_images(zip_path: String) -> Result<ZipListing, String> {
     .map_err(|e| e.to_string())?
 }
 
+// Read-only, but still limited to a root the user scanned: the report's covers
+// go through serve_thumb, which gates on SCAN_ROOTS anyway.
+#[tauri::command]
+async fn find_duplicates(
+    path: String,
+    on_progress: tauri::ipc::Channel<dupes::DupeProgress>,
+) -> Result<dupes::DupeReport, String> {
+    let root = PathBuf::from(&path);
+    if !lock_ok(scan_roots()).iter().any(|r| r == &root) {
+        return Err(format!("not a scanned directory: {}", path));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        dupes::find_duplicates_blocking(&root, Some(&on_progress))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// Moves a zip to the Recycle Bin (never a permanent delete: the trash crate
+// passes FOF_WANTNUKEWARNING with FOF_NO_UI, so a file too big for the bin
+// fails instead of being silently nuked). Same gate as covers — only archives
+// under a scanned root — so the webview can't delete arbitrary files.
+#[tauri::command]
+async fn trash_zip(path: String) -> Result<(), String> {
+    if !is_scanned_zip(&path) {
+        return Err(format!("not an archive under a scanned directory: {}", path));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        // Pooled handles hold the Windows file lock; release them now instead of
+        // waiting for the reaper. Clearing CURRENT_ZIP makes an in-flight read's
+        // return_archive drop its handle rather than re-pool it.
+        {
+            let mut cur = lock_ok(current_zip());
+            if *cur == path {
+                cur.clear();
+            }
+        }
+        lock_ok(archive_pool()).retain(|(p, _)| p != &path);
+        trash::delete(&path).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 // Thumbs are keyed by zip path+mtime, so a changed zip leaves its old thumb
 // orphaned forever. Age-based sweep on startup; evicted thumbs regenerate on view.
 fn clean_thumb_cache(thumbs_dir: &Path) {
@@ -708,7 +754,12 @@ pub fn run() {
             spawn_pool_reaper();
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![scan_directory, list_zip_images])
+        .invoke_handler(tauri::generate_handler![
+            scan_directory,
+            list_zip_images,
+            find_duplicates,
+            trash_zip
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

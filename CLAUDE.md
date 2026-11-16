@@ -26,7 +26,7 @@ Rust tests: `cd src-tauri && cargo test --lib`
 | Layer    | Tech |
 |----------|------|
 | Frontend | React 19, TypeScript, Vite 7, react-window 2 |
-| Backend  | Rust (Tauri v2), zip, walkdir, image, tokio (sync) |
+| Backend  | Rust (Tauri v2), zip, walkdir, image, tokio (sync), trash |
 | Pkg mgr  | pnpm |
 
 ## File layout
@@ -41,9 +41,11 @@ src/
     Sidebar.tsx         — search box, folder tree, zip list, context menu (react-window virtual list)
     Viewer.tsx          — image display (single/double/scroll modes)
     Gallery.tsx         — cover thumbnail grid (gallery mode)
+    Duplicates.tsx      — duplicate finder view: identical / overlap / problems tabs, Recycle
   hooks/
     useKeyboardShortcuts.ts — generic KeyBinding[] hook
     useZipLoader.ts     — open zip, page name list, orientation/failure tracking, srcFor()
+    useDuplicates.ts    — find_duplicates scan state + progress, recycled-path set
   utils/
     store.ts            — saveSetting / loadSetting wrappers for tauri-plugin-store
     pageUrl.ts          — builds `manga://` URLs: pageUrl() for pages, thumbUrl() for gallery covers
@@ -52,6 +54,7 @@ src/
 src-tauri/
   src/
     lib.rs              — all Tauri commands + the `manga://` protocol handler
+    dupes.rs            — duplicate detection (central-directory CRC32 parser + grouping)
     main.rs             — entry point
   Cargo.toml
   tauri.conf.json       — includes CSP
@@ -78,4 +81,6 @@ These span `src/` and `src-tauri/`, so they live here rather than in one side's 
   paged-mode preload.
 - **`spreadStride()` is the one double-mode pairing rule** — App and Viewer must agree on it.
 - **Sidebar state (`expandedFolders`, `sidebarQuery`) lives in App**, because gallery mode unmounts
-  the sidebar.
+  the sidebar. Same for the duplicates report (`useDuplicates` is called in App).
+- **Deleting goes to the Recycle Bin, gated like covers.** `trash_zip` only accepts archives under a
+  `SCAN_ROOTS` entry (`is_scanned_zip`); never add a permanent-delete path.

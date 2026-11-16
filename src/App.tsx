@@ -6,11 +6,13 @@ import { restoreStateCurrent, StateFlags } from "@tauri-apps/plugin-window-state
 import { FolderEntry, ViewMode } from "./types";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useZipLoader } from "./hooks/useZipLoader";
+import { useDuplicates } from "./hooks/useDuplicates";
 import { saveSetting, loadSetting } from "./utils/store";
 import { lastSpreadStart, spreadStride } from "./utils/spread";
 import { Sidebar } from "./components/Sidebar";
 import { Viewer } from "./components/Viewer";
 import { Gallery } from "./components/Gallery";
+import { Duplicates } from "./components/Duplicates";
 import "./App.css";
 
 const KEY_LAST_DIR = "lastDir";
@@ -18,6 +20,12 @@ const KEY_VIEW_MODE = "viewMode";
 
 function App() {
   const [folderTree, setFolderTree] = useState<FolderEntry[]>([]);
+  // The scanned root — find_duplicates only accepts a directory scan_directory saw
+  const [rootDir, setRootDir] = useState<string | null>(null);
+  // Not a ViewMode: it isn't persisted, and closing it returns to whichever
+  // reading mode was active
+  const [showDupes, setShowDupes] = useState(false);
+  const dupes = useDuplicates();
   const [selectedZip, setSelectedZip] = useState<string | null>(null);
   const [currentPage, setCurrentPage] = useState(0);
   const [viewMode, setViewMode] = useState<ViewMode>("single");
@@ -61,6 +69,7 @@ function App() {
       try {
         const tree = await invoke<FolderEntry[]>("scan_directory", { path: lastDir });
         setFolderTree(tree);
+        setRootDir(lastDir);
       } catch {
         // dir no longer exists
       }
@@ -69,6 +78,7 @@ function App() {
 
   const changeViewMode = useCallback((mode: ViewMode) => {
     setViewMode(mode);
+    setShowDupes(false);
     saveSetting(KEY_VIEW_MODE, mode).catch(console.error);
   }, []);
 
@@ -76,6 +86,7 @@ function App() {
     // Scan first — on failure (e.g. dropped path is not a directory) current state stays intact
     const tree = await invoke<FolderEntry[]>("scan_directory", { path: dir });
     setFolderTree(tree);
+    setRootDir(dir);
     setExpandedFolders(new Set()); // old root's folder paths are meaningless now
     await saveSetting(KEY_LAST_DIR, dir);
   }, []);
@@ -161,19 +172,34 @@ function App() {
   const zipIndex = useMemo(() => new Map(flat.map((p, i) => [p, i])), [flat]);
   const zipIdx = selectedZip ? zipIndex.get(selectedZip) ?? -1 : -1;
 
-  // In gallery mode a keyboard-opened zip has no visible viewer — switch to
-  // double mode (same as clicking a card) instead of loading invisibly
+  // In gallery mode (or the duplicates view) a keyboard-opened zip has no
+  // visible viewer — switch to one instead of loading invisibly
   const openZip = (path: string) => {
     selectZip(path);
+    setShowDupes(false);
     if (viewMode === "gallery") changeViewMode("double");
   };
+
+  // Drop a recycled zip from the tree in place rather than rescanning, which
+  // would also collapse every expanded folder
+  const removeFromTree = useCallback((path: string) => {
+    setFolderTree((tree) =>
+      tree
+        .map((f) =>
+          f.zip_files.some((z) => z.path === path)
+            ? { ...f, zip_files: f.zip_files.filter((z) => z.path !== path) }
+            : f,
+        )
+        .filter((f) => f.zip_files.length > 0),
+    );
+  }, []);
 
   const navigateZip = (delta: number) => {
     const next = zipIdx + delta;
     if (next >= 0 && next < flat.length) openZip(flat[next]);
   };
 
-  const pagedMode = viewMode === "single" || viewMode === "double";
+  const pagedMode = !showDupes && (viewMode === "single" || viewMode === "double");
 
   // Returning false leaves the event to the browser (native scrolling in scroll mode)
   // Forward clamps to lastPage, not images.length - 1, so a jump near the end
@@ -238,13 +264,19 @@ function App() {
           {(["single", "double", "scroll", "gallery"] as ViewMode[]).map((m) => (
             <button
               key={m}
-              className={`mode-btn${viewMode === m ? " mode-active" : ""}`}
+              className={`mode-btn${viewMode === m && !showDupes ? " mode-active" : ""}`}
               onClick={() => changeViewMode(m)}
             >
               {m === "single" ? "Single" : m === "double" ? "Double" : m === "scroll" ? "Scroll" : "Gallery"}
             </button>
           ))}
         </div>
+        <button
+          className={showDupes ? "mode-active" : ""}
+          onClick={() => setShowDupes((v) => !v)}
+        >
+          Duplicates
+        </button>
         <div className="toolbar-spacer" />
         {images.length > 0 && pagedMode && (
           <div className="nav-group">
@@ -261,13 +293,21 @@ function App() {
             </button>
           </div>
         )}
-        {images.length > 0 && viewMode === "scroll" && (
+        {images.length > 0 && viewMode === "scroll" && !showDupes && (
           <span className="page-info">{images.length} pages</span>
         )}
       </div>
 
       <div className="layout">
-        {viewMode === "gallery" ? (
+        {showDupes ? (
+          <Duplicates
+            state={dupes}
+            rootDir={rootDir}
+            onOpen={openZip}
+            onTrashed={removeFromTree}
+            onError={showNotice}
+          />
+        ) : viewMode === "gallery" ? (
           <Gallery
             folders={folderTree}
             selectedZip={selectedZip}

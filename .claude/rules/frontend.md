@@ -29,6 +29,11 @@ shared with the backend.
 - `effectiveStride` — `spreadStride(images, imgLandscape, currentPage, viewMode === "double")`
 - `lastPage` — `useMemo`'d `lastSpreadStart(...)`: target of `End`/`Numpad3` and the clamp for forward jumps
 - `flat` / `zipIndex` — `useMemo`'d flattened zip paths + path→index map for zip navigation
+- `rootDir` — the scanned root (set by startup scan and `scanDir`); what `find_duplicates` gets
+- `showDupes` — duplicates view on/off. **Not** a `ViewMode`: not persisted, and closing it returns
+  to the reading mode that was active. `changeViewMode` and `openZip` turn it off; `pagedMode` is
+  false while it is on, so page keys fall through to native scrolling
+- `dupes` — `useDuplicates()`; called here so the report survives opening a candidate to compare
 
 ## State (useZipLoader hook)
 Pages are `<img src>` pointing at `manga://`; the webview does the loading. The hook only tracks
@@ -68,6 +73,17 @@ The webview requests covers as cells scroll in and evicts them itself. Two thing
   node, and without the key the imperative `cover-failed` class would stick to it
 - `.gallery-cover` carries the placeholder colour as its own `background`; there is no separate
   placeholder element
+
+## Duplicates view
+`Duplicates.tsx`, rendered in `.layout` instead of sidebar/viewer/gallery when `showDupes`.
+`useDuplicates.scan(root)` invokes `find_duplicates` with a `Channel` for progress (a run counter
+drops stale results). Tabs: Identical / Overlap / Problems. Cards use `thumbUrl` covers (lazy,
+keyed by src). Actions: Open (`openZip` → leaves the view; double mode if coming from gallery),
+Show in folder, Recycle (`ask()` confirm → `trash_zip`). Recycled paths go into `deleted`; the view
+filters on it rather than editing the report, so item indices stay valid, and a group left with
+one member disappears. App's `removeFromTree` drops the path from `folderTree` in place (a rescan
+would collapse every expanded folder). Known gap: recycling the zip that is open in the viewer
+doesn't clear the viewer.
 
 ## Error toast
 `showNotice(msg)` in App.tsx — transient 4s toast (`.toast`), used for scan failures
