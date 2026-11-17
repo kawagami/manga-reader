@@ -9,8 +9,8 @@ See the cross-layer invariants in the root CLAUDE.md — URL format, immutabilit
 shared with the backend.
 
 ## npm packages
-- `@tauri-apps/api` — invoke, convertFileSrc (`manga://` origin), getCurrentWindow
-- `@tauri-apps/plugin-dialog` — open()
+- `@tauri-apps/api` — invoke, Channel (duplicates scan progress), convertFileSrc (`manga://` origin), getCurrentWindow
+- `@tauri-apps/plugin-dialog` — open() (folder picker), ask() (Recycle confirm)
 - `@tauri-apps/plugin-store` — Store.load()
 - `@tauri-apps/plugin-window-state` — restoreStateCurrent
 - `@tauri-apps/plugin-opener` — revealItemInDir
@@ -78,8 +78,8 @@ The webview requests covers as cells scroll in and evicts them itself. Two thing
 `Duplicates.tsx`, rendered in `.layout` instead of sidebar/viewer/gallery when `showDupes`.
 `useDuplicates.scan(root)` invokes `find_duplicates` with a `Channel` for progress (a run counter
 drops stale results). Tabs: Identical / Overlap / Problems. Cards use `thumbUrl` covers (lazy,
-keyed by src). Actions: Open (`openZip` → leaves the view; double mode if coming from gallery),
-Show in folder, Recycle (`ask()` confirm → `trash_zip`). Recycled paths go into `deleted`; the view
+keyed by src). Actions: Open (`openZip` → leaves the view; double mode if coming from gallery;
+not offered on Problems cards), Show in folder, Recycle (`ask()` confirm → `trash_zip`). Recycled paths go into `deleted`; the view
 filters on it rather than editing the report, so item indices stay valid, and a group left with
 one member disappears. App's `removeFromTree` drops the path from `folderTree` in place (a rescan
 would collapse every expanded folder). Known gap: recycling the zip that is open in the viewer
@@ -87,7 +87,9 @@ doesn't clear the viewer.
 
 ## Error toast
 `showNotice(msg)` in App.tsx — transient 4s toast (`.toast`), used for scan failures
-(drag-drop of invalid folder, Open Directory). Zip open failures render in Viewer instead.
+(drag-drop of invalid folder, Open Directory) and Recycle failures (Duplicates' `onError`).
+Zip open failures render in Viewer instead; `find_duplicates` failures render in the
+Duplicates header.
 
 ## Persistence (settings.json via tauri-plugin-store)
 - `lastDir` — last opened root directory (auto-scanned on startup)
@@ -112,8 +114,8 @@ must be up); a handler returning `false` declines the event (no `preventDefault`
 aimed at input/textarea/contentEditable are ignored (Ctrl/Alt/Meta combos still fire), as is IME
 composition.
 
-Page keys act only in single/double mode; in scroll and gallery mode the handler returns `false`,
-so the browser's native scrolling handles them. Zip keys work in every mode.
+Page keys act only in single/double mode; in scroll and gallery mode and the duplicates view the
+handler returns `false`, so the browser's native scrolling handles them. Zip keys work in every mode.
 
 | Key | Action |
 |-----|--------|
@@ -129,7 +131,7 @@ so the browser's native scrolling handles them. Zip keys work in every mode.
 | `Alt+↑` / `Numpad8` | Previous zip (cross-folder, sidebar order) |
 | `Alt+↓` / `Numpad5` | Next zip (cross-folder, sidebar order) |
 | `Numpad0` | Random zip from loaded tree (uniform over zips, with replacement) |
-| `Ctrl+F` | Focus sidebar search and select its text (no-op in gallery, but still claims the key so WebView2's find bar doesn't open) |
+| `Ctrl+F` | Focus sidebar search and select its text (no-op in gallery and the duplicates view, but still claims the key so WebView2's find bar doesn't open) |
 
 Zip nav / random use the **whole** tree, not the search results. Inside the search box: `Enter`
 opens the first result and blurs, `Esc` clears and blurs — both hand the keys back to the reader.

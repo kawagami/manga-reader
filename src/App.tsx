@@ -172,8 +172,9 @@ function App() {
   const zipIndex = useMemo(() => new Map(flat.map((p, i) => [p, i])), [flat]);
   const zipIdx = selectedZip ? zipIndex.get(selectedZip) ?? -1 : -1;
 
-  // In gallery mode (or the duplicates view) a keyboard-opened zip has no
-  // visible viewer — switch to one instead of loading invisibly
+  // In gallery mode or the duplicates view, a zip opened by a zip key or the
+  // duplicates list's Open button has no visible viewer — switch to one
+  // instead of loading invisibly
   const openZip = (path: string) => {
     selectZip(path);
     setShowDupes(false);
@@ -201,7 +202,8 @@ function App() {
 
   const pagedMode = !showDupes && (viewMode === "single" || viewMode === "double");
 
-  // Returning false leaves the event to the browser (native scrolling in scroll mode)
+  // Returning false leaves the event to the browser (native scrolling in
+  // scroll / gallery mode and the duplicates view)
   // Forward clamps to lastPage, not images.length - 1, so a jump near the end
   // lands on the real last spread; Math.max(p, …) keeps it from moving backwards
   // if the current page is already past it
@@ -218,7 +220,8 @@ function App() {
   };
 
   useKeyboardShortcuts([
-    // No-op in gallery mode (no sidebar mounted), but still claims the key
+    // No-op in gallery mode and the duplicates view (no sidebar mounted), but
+    // still claims the key
     { code: "KeyF", ctrl: true, handler: () => { searchRef.current?.select(); } },
     { code: "Numpad0", handler: () => {
       if (flat.length === 0) return;
