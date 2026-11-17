@@ -185,7 +185,7 @@ export function Duplicates({ state, rootDir, onOpen, onTrashed, onError }: Props
           {tab === "overlap" &&
             "One archive contains most or all pages of the other (collected edition, extra pages). Check before deleting."}
           {tab === "problems" &&
-            "Truncated downloads (no zip directory) and zips without images."}
+            "Archives that can't be read (most often a truncated download with no zip directory) and zips without images."}
         </span>
       </div>
 

@@ -26,7 +26,7 @@ export interface DupeItem {
 export interface OverlapPair {
   a: number; // the archive with more distinct pages (a_unique >= b_unique)
   b: number;
-  shared: number;
+  shared: number; // distinct pages in both, common (credit/ad) pages included
   a_unique: number; // distinct pages — `pages` counts entries, incl. repeated images
   b_unique: number;
   subset: boolean; // every page of b is in a

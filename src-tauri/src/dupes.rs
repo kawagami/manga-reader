@@ -158,8 +158,10 @@ pub struct DupeItem {
 
 #[derive(Serialize)]
 pub struct OverlapPair {
-    pub a: usize, // index into DupeReport::items — always the archive with more pages
+    pub a: usize, // index into DupeReport::items — always the archive with more distinct pages
     pub b: usize,
+    /// Distinct pages in both, common pages included (they're only left out of
+    /// the decision whether the pair overlaps at all)
     pub shared: usize,
     /// Distinct pages in each — `DupeItem::pages` counts entries, and an
     /// archive with the same blank page twice would make a subset look short
@@ -272,6 +274,23 @@ pub(crate) fn find_duplicates_blocking(
     Ok(report)
 }
 
+// Size of the intersection of two sorted, deduped key lists
+fn count_shared(a: &[PageKey], b: &[PageKey]) -> usize {
+    let (mut i, mut j, mut n) = (0, 0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                n += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    n
+}
+
 fn analyze(scanned: &[Scanned]) -> DupeReport {
     // Archives that make it into the report get a slot in `items`
     let mut items: Vec<DupeItem> = Vec::new();
@@ -361,21 +380,28 @@ fn analyze(scanned: &[Scanned]) -> DupeReport {
                 }
             }
         }
-        for (&pb, &shared) in &shared_with {
+        for (&pb, &rare_shared) in &shared_with {
             let (ib, kb) = &sets[pb];
             if ka == kb {
                 continue; // already an identical group
             }
             let smaller = ka.len().min(kb.len());
-            let ratio = shared as f64 / smaller as f64;
-            if shared >= OVERLAP_MIN_SHARED && ratio >= OVERLAP_MIN_RATIO {
-                let ((big, big_n), (small, small_n)) = if ka.len() >= kb.len() {
-                    ((*ia, ka.len()), (*ib, kb.len()))
-                } else {
-                    ((*ib, kb.len()), (*ia, ka.len()))
-                };
-                pairs.push(Pair { big, small, big_n, small_n, shared, ratio });
+            if rare_shared < OVERLAP_MIN_SHARED
+                || (rare_shared as f64 / smaller as f64) < OVERLAP_MIN_RATIO
+            {
+                continue;
             }
+            // Common pages only stay out of the decision above. The reported
+            // count includes them — otherwise a volume carrying the group's
+            // credit page could never show as a subset of its collected edition.
+            let shared = count_shared(ka, kb);
+            let ((big, big_n), (small, small_n)) = if ka.len() >= kb.len() {
+                ((*ia, ka.len()), (*ib, kb.len()))
+            } else {
+                ((*ib, kb.len()), (*ia, ka.len()))
+            };
+            let ratio = shared as f64 / small_n as f64;
+            pairs.push(Pair { big, small, big_n, small_n, shared, ratio });
         }
     }
     // subsets first, then by ratio, then by how many pages are at stake
@@ -520,5 +546,44 @@ mod tests {
         assert_eq!(r.broken.len(), 1);
         assert_eq!(r.items[r.broken[0].item].name, "broken.zip");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn common_pages_count_toward_shared_and_subset() {
+        let item = |name: &str| DupeItem {
+            path: format!(r"C:\lib\{}", name),
+            name: name.into(),
+            folder: "lib".into(),
+            size: 0,
+            mtime: 0,
+            pages: 0,
+        };
+        let credit: PageKey = (0xC0FFEE, 1);
+        let page = |i: u32| -> PageKey { (i, 100) };
+        let with_credit = |mut k: Vec<PageKey>| {
+            k.push(credit);
+            k.sort_unstable();
+            k
+        };
+        let mut scanned = vec![
+            Scanned { item: item("full.zip"), keys: Ok(with_credit((0..10).map(page).collect())) },
+            Scanned { item: item("vol.zip"), keys: Ok(with_credit((0..8).map(page).collect())) },
+        ];
+        // The credit page in 16 archives → above COMMON_PAGE_DF, so it can't
+        // decide an overlap on its own
+        for i in 0..14 {
+            scanned.push(Scanned {
+                item: item(&format!("other{}.zip", i)),
+                keys: Ok(with_credit(vec![page(1000 + i)])),
+            });
+        }
+
+        let r = analyze(&scanned);
+        assert_eq!(r.overlaps.len(), 1);
+        let o = &r.overlaps[0];
+        assert_eq!(r.items[o.a].name, "full.zip");
+        assert_eq!(r.items[o.b].name, "vol.zip");
+        assert_eq!((o.shared, o.a_unique, o.b_unique), (9, 11, 9));
+        assert!(o.subset);
     }
 }

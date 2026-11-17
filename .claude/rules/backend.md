@@ -62,8 +62,10 @@ archive; minutes on a HDD). If the recorded directory offset doesn't land on a `
 what an incomplete download looks like: starts with `PK\x03\x04`, no directory).
 `DupeReport`: `items` (only archives referenced below), `identical` (groups with equal key lists,
 sorted by reclaimable bytes), `overlaps` (pairs sharing ≥5 distinct pages and ≥60% of the smaller
-one's; pages found in >15 archives are ignored as credit/ad pages; `a` = larger, `subset` = all
-of `b` in `a`; `a_unique`/`b_unique` are distinct counts, since `pages` counts entries),
+one's; pages found in >15 archives are ignored as credit/ad pages **for that decision only** — the
+reported `shared` is the full distinct intersection (`count_shared`), so a volume carrying a common
+credit page can still be a `subset`; `a` = more distinct pages, `subset` = all of `b` in `a`;
+`a_unique`/`b_unique` are distinct counts, since `pages` counts entries),
 `broken`, `no_images`. ~3 s for 4.2k zips on a warm cache.
 Manual check: `DUPES_ROOT=D:\comic cargo test --lib dupes::tests::real_library -- --ignored --nocapture`.
 
